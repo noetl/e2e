@@ -6,16 +6,16 @@ metadata:
 
 workload:
   test_message: "Testing HTTP tool"
-  # Use the NoETL server ClusterIP directly (from kubectl get svc)
-  api_url: "http://10.96.86.212:8082"
+  # Use Kubernetes service DNS so the fixture survives ClusterIP rotation.
+  api_url: "http://noetl.noetl.svc.cluster.local:8082"
 
 workflow:
   - step: start
-    desc: Fetch health status from NoETL API using ClusterIP
+    desc: Fetch health status from NoETL API using service DNS
     tool:
       kind: http
       method: GET
-      url: "{{ api_url }}/api/health"
+      url: "{{ api_url }}/health"
     next:
       spec:
         mode: exclusive
@@ -28,10 +28,7 @@ workflow:
       kind: python
       code: |
             print(f"[PROCESS] Processing HTTP response")
-            print(f"[PROCESS] Input data type: {type(input_data).__name__}")
-
-            # Extract HTTP response from args
-            http_response = input_data.get('http_response', {}) if isinstance(input_data, dict) else input_data
+            print(f"[PROCESS] HTTP response type: {type(http_response).__name__}")
 
             if isinstance(http_response, dict):
                 status_code = http_response.get('status_code', 0)
@@ -41,13 +38,13 @@ workflow:
                 print(f"[PROCESS] Body type: {type(body).__name__}")
                 print(f"[PROCESS] Body content: {body}")
 
-                return {
+                result = {
                     "status": "ok",
                     "status_code": status_code,
                     "body": body
                 }
-
-            return {"status": "error", "message": "Invalid HTTP response format"}
+            else:
+                result = {"status": "error", "message": "Invalid HTTP response format"}
     input:
       http_response: "{{ start }}"
     next:
@@ -62,8 +59,6 @@ workflow:
       kind: python
       code: |
             print(f"[VERIFY] Verifying HTTP test results")
-
-            process_result = input_data.get('process_result', {})
 
             if isinstance(process_result, str):
                 import json, ast
@@ -83,7 +78,7 @@ workflow:
             }
 
             print(f"[VERIFY] Verification: {verification['status']}")
-            return verification
+            result = verification
     input:
       process_result: "{{ process }}"
     next:
@@ -99,8 +94,6 @@ workflow:
       code: |
             print(f"[END] HTTP test completed successfully!")
 
-            verify_result = input_data.get('verify_result', {})
-
             if isinstance(verify_result, str):
                 import json, ast
                 try:
@@ -114,6 +107,6 @@ workflow:
             print(f"[END] Verification status: {status}")
             print(f"[END] HTTP status code: {status_code}")
 
-            return {"status": "completed", "test_passed": status == "passed"}
+            result = {"status": "completed", "test_passed": status == "passed"}
     input:
       verify_result: "{{ verify }}"

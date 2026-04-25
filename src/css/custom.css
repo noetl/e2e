@@ -1,0 +1,20 @@
+:root {
+  --ifm-color-primary: #246b5b;
+  --ifm-color-primary-dark: #205f51;
+  --ifm-color-primary-darker: #1d564a;
+  --ifm-color-primary-darkest: #18473d;
+  --ifm-color-primary-light: #2a7a68;
+  --ifm-color-primary-lighter: #328b78;
+  --ifm-color-primary-lightest: #3b9d88;
+  --ifm-code-font-size: 95%;
+}
+
+.theme-doc-markdown table {
+  display: table;
+  width: 100%;
+}
+
+.theme-doc-markdown th,
+.theme-doc-markdown td {
+  vertical-align: top;
+}
