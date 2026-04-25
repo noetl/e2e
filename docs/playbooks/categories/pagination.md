@@ -1,0 +1,21 @@
+---
+id: pagination
+title: Pagination
+---
+
+Playbooks in `pagination`.
+
+| Catalog path | Fixture file | Description | Tools |
+| --- | --- | --- | --- |
+| `fixtures/playbooks/pagination/fetch_load_test` | `fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml` | Fetch-step load test: 500 patients, paginated FHIR-like responses (~100KB/page, 2-5 pages each).  Validates that max_in_flight: 5 on fetch steps holds under realistic load without worker crash or OOM — reproducing the structure of fetch_medications in state_report_generation_prod_v10.yaml that caused CrashLoopBackOff at max_in_flight: 20.  Go/no-go criterion: all 500 patients processed and no worker restart. Target execution time at max_in_flight: 5 — see README.md for timing expectations.  | postgres, python |
+| `tests/pagination/basic/basic` | `fixtures/playbooks/pagination/basic/test_pagination_basic.yaml` | Async non-blocking HTTP probe using canonical DSL fields | http, python |
+| `tests/pagination/cursor/cursor` | `fixtures/playbooks/pagination/cursor/test_pagination_cursor.yaml` | Cursor-based pagination test using canonical format | http, python |
+| `tests/pagination/loop_with_pagination/loop_with_pagination` | `fixtures/playbooks/pagination/loop_with_pagination/test_loop_with_pagination.yaml` | Test loop with HTTP pagination using sink-driven architecture.  This playbook demonstrates: 1. HTTP tool for API calls (no Python requests library) 2. Sink to Postgres for data storage (each page saved immediately) 3. Result references instead of full payloads in events/NATS 4. Loop + pagination without payload size issues  | postgres, python |
+| `tests/pagination/max_iterations/max_iterations` | `fixtures/playbooks/pagination/max_iterations/test_pagination_max_iterations.yaml` | Test max_iterations safety limit | python |
+| `tests/pagination/offset/offset` | `fixtures/playbooks/pagination/offset/test_pagination_offset.yaml` | Offset-based pagination test using canonical format | http, python |
+| `tests/pagination/pipeline` | `fixtures/playbooks/pagination/pipeline/test_pagination_pipeline.yaml` | Task sequence pagination test demonstrating tool.spec.policy.rules flow control.  Uses labeled tasks in tool: pipeline with tool.spec.policy.rules: for per-task flow control: - _prev threads data between tasks (like Clojure's -&gt;) - tool.spec.policy.rules: provides per-task error handling - Retry, break, fail, continue control actions - output object for accessing execution results  | noop, postgres, python |
+| `tests/pagination/pipeline/errors` | `fixtures/playbooks/pagination/pipeline/test_pipeline_error_handling.yaml` | Tests tool.spec.policy.rules error handling patterns in task sequence execution.  Validates: - Retry on transient errors (500, 503) - Rate limit handling with Retry-After header - Continue on transform errors (skip pattern) - Fail on auth errors (401, 403) - output variable access in policy conditions  | noop, python |
+| `tests/pagination/pipeline/heavy` | `fixtures/playbooks/pagination/pipeline/test_pipeline_heavy_payload.yaml` | Heavy payload task sequence test for load testing result storage and threading.  Tests: - Large HTTP responses (configurable KB per item) - Result externalization to NATS KV/Object Store - _prev threading with large data - Memory-efficient task sequence execution  | noop, python |
+| `tests/pagination/pipeline/simple` | `fixtures/playbooks/pagination/pipeline/test_pipeline_simple.yaml` | Simple task sequence test with fetch -&gt; transform -&gt; validate | python |
+| `tests/pagination/pipeline_v2` | `fixtures/playbooks/pagination/pipeline_v2/test_pagination_pipeline_v2.yaml` | Task sequence pagination test demonstrating tool.spec.policy.rules flow control.  Uses labeled tasks in tool: pipeline with tool.spec.policy.rules: for per-task flow control: - _prev threads data between tasks (like Clojure's -&gt;) - tool.spec.policy.rules: provides per-task error handling - Retry, jump, fail, break, continue control actions - output object for accessing execution results  | noop, postgres, python |
+| `tests/pagination/retry/retry` | `fixtures/playbooks/pagination/retry/test_pagination_retry.yaml` | Pagination with retry for failed requests | python |
