@@ -51,7 +51,7 @@ except Exception:  # pragma: no cover - harmless outside IPython
 def find_repo_root(start: Path) -> Path:
     cur = start
     for _ in range(10):
-        candidate = cur / 'tests' / 'fixtures' / 'credentials' / 'pg_local.json'
+        candidate = cur / 'fixtures' / 'credentials' / 'pg_local.json'
         if candidate.exists():
             return cur
         if cur.parent == cur:
@@ -61,13 +61,13 @@ def find_repo_root(start: Path) -> Path:
 
 
 REPO = find_repo_root(Path.cwd())
-cred_path = REPO / 'tests' / 'fixtures' / 'credentials' / 'pg_local.json'
+cred_path = REPO / 'fixtures' / 'credentials' / 'pg_local.json'
 cfg = None
 if cred_path.exists():
     try:
         cfg = json.loads(cred_path.read_text())
     except Exception as e:
-        logger.info('Failed to read pg_local.json:', e)
+        logger.info('Failed to read pg_local.json: %s', e)
 
 host = os.getenv('PGHOST') or (cfg and cfg.get('data', {}).get('db_host')) or 'localhost'
 port = int(os.getenv('PGPORT') or (cfg and cfg.get('data', {}).get('db_port') or 54321))
@@ -78,7 +78,7 @@ database = os.getenv('PGDATABASE') or (cfg and cfg.get('data', {}).get('db_name'
 # If the detected host is the in-cluster DNS and you're running locally, you may want to override
 # to localhost:54321. Leave as-is when running inside the Kind JupyterLab.
 pg_dsn = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
-logger.info('Primary DSN:', pg_dsn)
+logger.info('Primary DSN: %s', pg_dsn)
 
 # Attempt primary connection; on failure, fallback to localhost:54321 which is mapped by Kind.
 def create_engine_with_fallback(primary_dsn: str):
@@ -90,9 +90,9 @@ def create_engine_with_fallback(primary_dsn: str):
         logger.info('Connected with primary DSN')
         return eng
     except Exception as e:
-        logger.info('Primary DSN failed, trying localhost fallback:', e)
+        logger.info('Primary DSN failed, trying localhost fallback: %s', e)
         fallback_dsn = f"postgresql+psycopg2://{user}:{password}@localhost:54321/{database}"
-        logger.info('Fallback DSN:', fallback_dsn)
+        logger.info('Fallback DSN: %s', fallback_dsn)
         eng = sa.create_engine(fallback_dsn, pool_pre_ping=True, future=True)
         with eng.connect() as conn:
             conn.execute(text('select 1'))
@@ -101,7 +101,7 @@ def create_engine_with_fallback(primary_dsn: str):
 
 engine = create_engine_with_fallback(pg_dsn)
 with engine.connect() as conn:
-    logger.info('DB time:', list(conn.execute(text('select now()')))[0][0])
+    logger.info('DB time: %s', list(conn.execute(text('select now()')))[0][0])
 
 #%% md
 ## Parameters

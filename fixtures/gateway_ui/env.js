@@ -45,7 +45,7 @@
   const configs = {
     local: {
       name: 'Local Development',
-      gatewayUrl: 'http://localhost:8080',
+      gatewayUrl: 'http://localhost:8090',
       description: 'Direct connection to locally running gateway (cargo run)'
     },
     kind: {

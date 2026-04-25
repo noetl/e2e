@@ -123,7 +123,12 @@ workflow:
       command: |
         WITH upserted_user AS (
           INSERT INTO auth.users (auth0_id, email, display_name, last_login_at)
-          VALUES ('{{ validate_token.sub }}', '{{ validate_token.email }}', '{{ validate_token.name }}', NOW())
+          VALUES (
+            ('{{ validate_token.sub | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            ('{{ validate_token.email | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            ('{{ validate_token.name | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            NOW()
+          )
           ON CONFLICT (auth0_id)
           DO UPDATE SET
             email = EXCLUDED.email,
@@ -134,8 +139,8 @@ workflow:
         INSERT INTO auth.sessions (user_id, session_token, auth0_token, expires_at, ip_address)
         SELECT
           u.user_id,
-          replace(gen_random_uuid()::text, '-', ''),
-          '{{ auth0_token }}',
+          md5(random()::text || clock_timestamp()::text),
+          ('{{ auth0_token | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
           NOW() + INTERVAL '24 hours',
           '{{ client_ip }}'::inet
         FROM upserted_user u

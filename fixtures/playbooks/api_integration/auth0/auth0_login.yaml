@@ -59,8 +59,10 @@ workflow:
       libs:
         base64: base64
         json: json
+        time: time
       code: |
         token = context.get('auth0_token', '')
+        auth0_domain = context.get('auth0_domain', '')
         try:
             parts = token.split('.')
             if len(parts) != 3:
@@ -71,6 +73,14 @@ workflow:
                 payload += '=' * padding
             decoded_bytes = base64.urlsafe_b64decode(payload)
             decoded = json.loads(decoded_bytes)
+            issuer = decoded.get("iss")
+            if auth0_domain and issuer != f"https://{auth0_domain}/":
+                raise ValueError("Invalid token issuer")
+            exp = decoded.get("exp")
+            if exp is not None and int(exp) <= int(time.time()):
+                raise ValueError("Token has expired")
+            if not decoded.get("sub"):
+                raise ValueError("Missing token subject")
             result = {
                 "sub": decoded.get("sub"),
                 "email": decoded.get("email"),
@@ -129,7 +139,12 @@ workflow:
       command: |
         WITH upserted_user AS (
           INSERT INTO auth.users (auth0_id, email, display_name, last_login_at)
-          VALUES ('{{ start.sub }}', '{{ start.email }}', '{{ start.name }}', NOW())
+          VALUES (
+            ('{{ start.sub | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            ('{{ start.email | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            ('{{ start.name | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            NOW()
+          )
           ON CONFLICT (auth0_id)
           DO UPDATE SET
             email = EXCLUDED.email,
@@ -140,8 +155,8 @@ workflow:
         INSERT INTO auth.sessions (user_id, session_token, auth0_token, expires_at, ip_address)
         SELECT
           u.user_id,
-          replace(gen_random_uuid()::text, '-', ''),
-          '{{ auth0_token }}',
+          md5(random()::text || clock_timestamp()::text),
+          ('{{ auth0_token | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
           NOW() + INTERVAL '24 hours',
           '{{ client_ip }}'::inet
         FROM upserted_user u

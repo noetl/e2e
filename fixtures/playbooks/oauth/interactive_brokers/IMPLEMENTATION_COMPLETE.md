@@ -198,9 +198,9 @@ tail -f logs/noetl.log | grep "IBKR:"
 
 ## Paper Trading Account
 
-**Username**: `wzeeym257`
-**Account**: `DU8027814`
-**Password**: `Test202$` (for portal login only, not API)
+**Username**: `YOUR_PAPER_TRADING_USERNAME`
+**Account**: `YOUR_ACCOUNT_ID`
+**Password**: `YOUR_PAPER_TRADING_PASSWORD` (for portal login only, not API)
 
 ## API Reference
 
@@ -259,7 +259,7 @@ pyproject.toml                  # Dependencies (PyJWT added)
 1. **OAuth App Creation Required**: User must create OAuth application in IBKR portal before testing
 2. **RSA Key Management**: Private keys must be stored securely (never commit to git)
 3. **Token Lifetime**: ~24 hour tokens require refresh logic (implemented with 5-minute buffer)
-4. **Paper Trading Only**: Current account is paper trading (DU8027814)
+4. **Paper Trading Only**: Current account is paper trading (YOUR_ACCOUNT_ID)
 5. **API Documentation**: Full API spec in api-docs.json (2.21.0)
 
 ## Security Notes

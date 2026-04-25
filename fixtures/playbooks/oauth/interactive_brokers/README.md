@@ -72,7 +72,7 @@ Create `fixtures/credentials/ib_oauth.json`:
   "data": {
     "consumer_key": "your-consumer-key-here",
     "consumer_secret": "your-consumer-secret-here",
-    "account_id": "DU8027814",
+    "account_id": "YOUR_ACCOUNT_ID",
     "environment": "paper",
     "api_base_url": "https://api.ibkr.com/v1/api",
     "oauth_version": "2.0"
@@ -81,9 +81,9 @@ Create `fixtures/credentials/ib_oauth.json`:
 ```
 
 **Note**: Your paper trading account details:
-- Username: `wzeeym257`
-- Password: `Test202$`
-- Account ID: `DU8027814` (paper trading account)
+- Username: `YOUR_PAPER_TRADING_USERNAME`
+- Password: `YOUR_PAPER_TRADING_PASSWORD`
+- Account ID: `YOUR_ACCOUNT_ID` (paper trading account)
 
 ### 3. Register Credential with NoETL
 
@@ -107,7 +107,7 @@ Edit the `workload` section in `ib_oauth.yaml`:
 ```yaml
 workload:
   ib_auth: ib_oauth                # Credential name in NoETL
-  account_id: DU8027814            # Your paper trading account ID
+  account_id: YOUR_ACCOUNT_ID            # Your paper trading account ID
   environment: paper               # 'paper' or 'live'
   message: Test IBKR OAuth authentication
 ```
@@ -131,7 +131,7 @@ Successful execution should show:
   "status": "success",
   "message": "IBKR OAuth authentication fully verified!",
   "accounts_found": 1,
-  "account_id": "DU8027814",
+  "account_id": "YOUR_ACCOUNT_ID",
   "portfolio_accessed": "SUCCESS",
   "validation": "OAuth token generated, API calls succeeded"
 }

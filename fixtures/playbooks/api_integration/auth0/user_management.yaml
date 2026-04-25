@@ -289,33 +289,46 @@ workflow:
   # UPDATE USER ROLES - Replace user's roles
   # ============================================================================
   - step: delete_user_roles
-    desc: Remove existing roles for user
+    desc: Atomically replace existing roles for user
     tool:
       kind: postgres
       auth: "{{ db_credential }}"
       command: |
-        DELETE FROM auth.user_roles WHERE user_id = {{ user_id }};
+        WITH requested_roles AS (
+          SELECT DISTINCT value AS role_name
+          FROM jsonb_array_elements_text('{{ role_names | tojson | replace("'", "''") }}'::jsonb)
+        ),
+        deleted_roles AS (
+          DELETE FROM auth.user_roles
+          WHERE user_id = {{ user_id }}
+          RETURNING role_id
+        ),
+        inserted_roles AS (
+          INSERT INTO auth.user_roles (user_id, role_id, granted_by)
+          SELECT
+            {{ user_id }},
+            r.role_id,
+            {% if granted_by %}{{ granted_by }}{% else %}NULL{% endif %}
+          FROM auth.roles r
+          JOIN requested_roles rr ON rr.role_name = r.role_name
+          ON CONFLICT (user_id, role_id) DO NOTHING
+          RETURNING role_id
+        )
+        SELECT role_id
+        FROM inserted_roles;
     next:
       spec:
         mode: exclusive
       arcs:
-        - step: insert_user_roles
+        - step: get_updated_roles
 
   - step: insert_user_roles
-    desc: Insert new roles for user
+    desc: Deprecated no-op; role replacement is handled atomically in delete_user_roles
     tool:
       kind: postgres
       auth: "{{ db_credential }}"
       command: |
-        INSERT INTO auth.user_roles (user_id, role_id, granted_by)
-        SELECT
-          {{ user_id }},
-          r.role_id,
-          {% if granted_by %}{{ granted_by }}{% else %}NULL{% endif %}
-        FROM auth.roles r
-        WHERE r.role_name = ANY(ARRAY[{% for name in role_names %}'{{ name }}'{% if not loop.last %},{% endif %}{% endfor %}])
-        ON CONFLICT (user_id, role_id) DO NOTHING
-        RETURNING role_id;
+        SELECT 1;
     next:
       spec:
         mode: exclusive

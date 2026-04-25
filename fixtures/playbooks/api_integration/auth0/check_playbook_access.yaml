@@ -52,7 +52,7 @@ workflow:
         SELECT s.user_id, u.email, u.display_name
         FROM auth.sessions s
         JOIN auth.users u ON s.user_id = u.user_id
-        WHERE s.session_token = '{{ session_token }}'
+        WHERE s.session_token = ('{{ session_token | tojson | replace("'", "''") }}'::jsonb #>> '{}')
           AND s.is_active = true
           AND s.expires_at > NOW()
           AND u.is_active = true;
@@ -79,14 +79,14 @@ workflow:
         WHERE ur.user_id = {{ get_user_from_session.command_0.rows[0].user_id }}
           AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
           AND (
-            pp.playbook_path = '{{ playbook_path }}'
-            OR (pp.allow_pattern IS NOT NULL AND '{{ playbook_path }}' LIKE pp.allow_pattern)
+            pp.playbook_path = ('{{ playbook_path | tojson | replace("'", "''") }}'::jsonb #>> '{}')
+            OR (pp.allow_pattern IS NOT NULL AND ('{{ playbook_path | tojson | replace("'", "''") }}'::jsonb #>> '{}') LIKE pp.allow_pattern)
           )
-          AND (pp.deny_pattern IS NULL OR '{{ playbook_path }}' NOT LIKE pp.deny_pattern)
+          AND (pp.deny_pattern IS NULL OR ('{{ playbook_path | tojson | replace("'", "''") }}'::jsonb #>> '{}') NOT LIKE pp.deny_pattern)
           AND (
-            ('{{ action }}' = 'execute' AND pp.can_execute = true)
-            OR ('{{ action }}' = 'view' AND pp.can_view = true)
-            OR ('{{ action }}' = 'modify' AND pp.can_modify = true)
+            (('{{ action | tojson | replace("'", "''") }}'::jsonb #>> '{}') = 'execute' AND pp.can_execute = true)
+            OR (('{{ action | tojson | replace("'", "''") }}'::jsonb #>> '{}') = 'view' AND pp.can_view = true)
+            OR (('{{ action | tojson | replace("'", "''") }}'::jsonb #>> '{}') = 'modify' AND pp.can_modify = true)
           );
     next:
       spec:

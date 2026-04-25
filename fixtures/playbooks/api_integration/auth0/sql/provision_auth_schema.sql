@@ -137,7 +137,7 @@ CREATE TABLE IF NOT EXISTS auth.playbook_permissions (
     deny_pattern VARCHAR(500),  -- Explicit deny pattern (takes precedence)
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT playbook_path_format CHECK (playbook_path ~ '^[a-z0-9/_*-]+$')
+    CONSTRAINT playbook_path_format CHECK (playbook_path ~ '^[a-z0-9/_*%-]+$')
 );
 
 CREATE INDEX idx_playbook_perms_role ON auth.playbook_permissions(role_id);

@@ -29,7 +29,7 @@ workload:
   auth0_domain: "{{ auth0_domain | default('mestumre-development.us.auth0.com') }}"
   client_id: "{{ client_id | default('Jqop7YoaiZalLHdBRo5ScNQ1RJhbhbDN') }}"
   auth0_credential: "{{ auth0_credential | default('auth0_client') }}"
-  audience: "{{ audience | default('https://' + auth0_domain | default('mestumre-development.us.auth0.com') + '/me/') }}"
+  audience: "{{ audience | default('https://' + auth0_domain + '/me/') }}"
 
 keychain:
   - name: auth0_credentials

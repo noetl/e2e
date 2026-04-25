@@ -234,7 +234,7 @@ Interactive Brokers supports OAuth 2.0 for server-to-server API authentication:
   "data": {
     "consumer_key": "your-consumer-key",
     "consumer_secret": "your-consumer-secret",
-    "account_id": "DU8027814",
+    "account_id": "YOUR_ACCOUNT_ID",
     "environment": "paper",
     "api_base_url": "https://api.ibkr.com/v1/api",
     "oauth_version": "2.0"
@@ -250,9 +250,9 @@ Interactive Brokers supports OAuth 2.0 for server-to-server API authentication:
 5. Use paper trading account for testing (expires after 60 days inactivity)
 
 **Paper Trading Account**:
-- Username: `wzeeym257`
-- Password: `Test202$`
-- Account ID: `DU8027814`
+- Username: `YOUR_PAPER_TRADING_USERNAME`
+- Password: `YOUR_PAPER_TRADING_PASSWORD`
+- Account ID: `YOUR_ACCOUNT_ID`
 
 **Important**: Username/password are only used to login to IBKR portal to create OAuth app. The OAuth credentials (consumer_key/secret) are what gets stored and used for API access.
 
@@ -332,7 +332,7 @@ IBKR uses JWT-based client assertion (RFC 7521) instead of simple consumer_key/s
 - Client assertion JWT includes: iss, sub, aud, exp, iat claims
 - Access tokens are valid for ~24 hours (86399 seconds)
 - Tokens are cached and auto-refreshed before expiry
-- Paper trading account: Username `wzeeym257`, Account `DU8027814`
+- Paper trading account: Username `YOUR_PAPER_TRADING_USERNAME`, Account `YOUR_ACCOUNT_ID`
 
 **Token Provider Implementation**: `noetl/core/auth/ib_provider.py`
 

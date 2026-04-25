@@ -10,7 +10,7 @@ metadata:
 
     Prerequisites:
     - PostgreSQL database accessible
-    - Admin credentials registered as 'pg_k8s'
+    - Admin credentials registered as 'pg_auth'
   tags:
     - auth0
     - database

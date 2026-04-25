@@ -217,7 +217,7 @@ class IBTokenProvider(TokenProvider):
     "client_id": "your-oauth-client-id",
     "key_id": "your-rsa-key-id",
     "private_key": "-----BEGIN PRIVATE KEY-----\nYOUR_RSA_PRIVATE_KEY\n-----END PRIVATE KEY-----",
-    "account_id": "DU8027814",
+    "account_id": "YOUR_ACCOUNT_ID",
     "environment": "paper",
     "api_base_url": "https://api.ibkr.com/v1"
   }
@@ -226,9 +226,9 @@ class IBTokenProvider(TokenProvider):
 
 ### 3. Paper Trading Account Details
 
-- **Username**: `wzeeym257`
-- **Password**: `Test202$`
-- **Account ID**: `DU8027814`
+- **Username**: `YOUR_PAPER_TRADING_USERNAME`
+- **Password**: `YOUR_PAPER_TRADING_PASSWORD`
+- **Account ID**: `YOUR_ACCOUNT_ID`
 - **Environment**: Paper Trading
 
 **Note**: Username/password are ONLY for logging into IBKR portal to create OAuth application. The OAuth flow uses client_id + signed JWT for API authentication.
