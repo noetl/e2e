@@ -162,11 +162,24 @@ workflow:
     tool:
       kind: python
       input:
-        batch_number: '{{ start.batch_number }}'
-        offset: '{{ start.offset }}'
+        # NOTE: reference workload directly. Pulling these from `start.*` worked
+        # pre-loop (see fetch_batch_ids SQL) but the input renderer for steps
+        # reached via `event.name == "loop.done"` arcs currently drops earlier
+        # step outputs from scope, so `{{ start.batch_number }}` arrived here
+        # unrendered and int() rejected the literal template string. Tracked in
+        # ai-meta sync/issues/2026-04-28-bug-mds-batch-worker-end-step-template-
+        # hydration.md — revisit this fixture once the engine fix lands.
+        batch_number: '{{ workload.batch_number }}'
+        offset: '{{ workload.offset }}'
       code: |
+        def _to_int(v, d):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return d
+
         result = {
             "status": "completed",
-            "batch_number": int(batch_number) if batch_number else 0,
-            "offset": int(offset) if offset else 0,
+            "batch_number": _to_int(batch_number, 0),
+            "offset": _to_int(offset, 0),
         }
