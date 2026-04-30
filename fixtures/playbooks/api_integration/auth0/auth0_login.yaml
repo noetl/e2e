@@ -14,7 +14,7 @@ metadata:
 
     Flow:
       1. start: Validate JWT token (merged with entry point)
-      2. create_user_session: Upsert user + create session (pooled postgres CTE)
+      2. create_user_session: Upsert user, inherit same-email roles, create session, and return roles
       3. cache_and_callback: Cache session + send callback (inline tasks)
       4. end: Complete
 
@@ -129,9 +129,9 @@ workflow:
       arcs:
         - step: end
 
-  # Step 2: Combined upsert user + create session (pooled postgres CTE)
+  # Step 2: Combined upsert user + role lookup + create session (pooled postgres CTE)
   - step: create_user_session
-    desc: Upsert user and create session in single transaction
+    desc: Upsert user, inherit same-email roles, and create session in single transaction
     tool:
       kind: postgres
       auth: "{{ db_credential }}"
@@ -151,21 +151,53 @@ workflow:
             display_name = EXCLUDED.display_name,
             last_login_at = NOW()
           RETURNING user_id, email, display_name, is_active
+        ),
+        copied_roles AS (
+          INSERT INTO auth.user_roles (user_id, role_id)
+          SELECT u.user_id, ur.role_id
+          FROM upserted_user u
+          JOIN auth.users same_email
+            ON same_email.email = u.email
+           AND same_email.user_id <> u.user_id
+          JOIN auth.user_roles ur
+            ON ur.user_id = same_email.user_id
+          WHERE ur.expires_at IS NULL OR ur.expires_at > NOW()
+          ON CONFLICT (user_id, role_id) DO NOTHING
+          RETURNING role_id
+        ),
+        created_session AS (
+          INSERT INTO auth.sessions (user_id, session_token, auth0_token, expires_at, ip_address)
+          SELECT
+            u.user_id,
+            md5(random()::text || clock_timestamp()::text),
+            ('{{ auth0_token | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
+            NOW() + INTERVAL '24 hours',
+            '{{ client_ip }}'::inet
+          FROM upserted_user u
+          RETURNING session_token, user_id, expires_at
+        ),
+        resolved_roles AS (
+          SELECT COALESCE(
+            json_agg(r.role_name ORDER BY r.role_name) FILTER (WHERE r.role_id IS NOT NULL),
+            '[]'::json
+          ) AS roles
+          FROM upserted_user u
+          LEFT JOIN auth.user_roles ur
+            ON ur.user_id = u.user_id
+           AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+          LEFT JOIN auth.roles r
+            ON r.role_id = ur.role_id
         )
-        INSERT INTO auth.sessions (user_id, session_token, auth0_token, expires_at, ip_address)
         SELECT
-          u.user_id,
-          md5(random()::text || clock_timestamp()::text),
-          ('{{ auth0_token | tojson | replace("'", "''") }}'::jsonb #>> '{}'),
-          NOW() + INTERVAL '24 hours',
-          '{{ client_ip }}'::inet
-        FROM upserted_user u
-        RETURNING
-          session_token,
-          user_id,
-          expires_at,
-          (SELECT email FROM upserted_user) as email,
-          (SELECT display_name FROM upserted_user) as display_name;
+          s.session_token,
+          s.user_id,
+          s.expires_at,
+          u.email,
+          u.display_name,
+          rr.roles
+        FROM created_session s
+        JOIN upserted_user u ON u.user_id = s.user_id
+        CROSS JOIN resolved_roles rr;
       spec:
         policy:
           rules:
@@ -179,7 +211,7 @@ workflow:
       spec:
         mode: exclusive
       arcs:
-        - step: get_user_roles
+        - step: prepare_session_cache
           when: "{{ create_user_session.rows is defined and create_user_session.rows | length > 0 }}"
         - step: send_db_error_callback
           when: "{{ (create_user_session.rows is not defined or create_user_session.rows | length == 0) and request_id }}"
@@ -205,26 +237,6 @@ workflow:
         mode: exclusive
       arcs:
         - step: end
-
-  - step: get_user_roles
-    desc: Fetch roles for authenticated user
-    tool:
-      kind: postgres
-      auth: "{{ db_credential }}"
-      command: |
-        SELECT COALESCE(
-          json_agg(r.role_name ORDER BY r.role_name) FILTER (WHERE r.role_id IS NOT NULL),
-          '[]'::json
-        ) AS roles
-        FROM auth.user_roles ur
-        JOIN auth.roles r ON ur.role_id = r.role_id
-        WHERE ur.user_id = {{ create_user_session.rows[0].user_id }}
-          AND (ur.expires_at IS NULL OR ur.expires_at > NOW());
-    next:
-      spec:
-        mode: exclusive
-      arcs:
-        - step: prepare_session_cache
 
   - step: prepare_session_cache
     desc: Prepare session payload with roles
@@ -276,10 +288,12 @@ workflow:
                     return candidate
             return []
 
-        session_rows = rows_from_step("create_user_session", "create_user_session_task")
-        role_rows = rows_from_step("get_user_roles")
+        session_rows = (
+            rows_from_step("create_user_session", "create_user_session_task")
+            or rows_from_step("create_user_session:task_sequence", "create_user_session_task")
+        )
         session_row = session_rows[0] if session_rows else {}
-        roles = (role_rows[0] if role_rows else {}).get('roles', [])
+        roles = session_row.get('roles', [])
         if isinstance(roles, str):
             try:
                 roles = json.loads(roles)
