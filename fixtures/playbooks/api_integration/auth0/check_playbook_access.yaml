@@ -60,10 +60,68 @@ workflow:
       spec:
         mode: exclusive
       arcs:
+        - step: normalize_session
+
+  - step: normalize_session
+    desc: Normalize session lookup rows across runtime result envelopes
+    tool:
+      kind: python
+      input:
+        session_result: "{{ get_user_from_session }}"
+      code: |
+        def pick(obj, *keys):
+            current = obj
+            for key in keys:
+                if current is None:
+                    return None
+                if isinstance(current, dict):
+                    current = current.get(key)
+                    continue
+                getter = getattr(current, "get", None)
+                if callable(getter):
+                    try:
+                        current = getter(key)
+                        continue
+                    except Exception:
+                        pass
+                try:
+                    current = getattr(current, key)
+                except Exception:
+                    return None
+            return current
+
+        rows = []
+        for candidate in (
+            pick(session_result, "rows"),
+            pick(session_result, "context", "rows"),
+            pick(session_result, "context", "_prev", "rows"),
+            pick(session_result, "data", "rows"),
+            pick(session_result, "data", "context", "rows"),
+            pick(session_result, "command_0", "rows"),
+            pick(session_result, "context", "command_0", "rows"),
+            pick(session_result, "context", "results", "command_0", "rows"),
+        ):
+            if candidate:
+                rows = candidate
+                break
+
+        user = rows[0] if rows else {}
+        result = {
+            "rows": rows,
+            "user": {
+                "user_id": user.get("user_id"),
+                "email": user.get("email"),
+                "display_name": user.get("display_name"),
+            },
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
         - step: check_permission
-          when: "{{ get_user_from_session.command_0 is defined and get_user_from_session.command_0.rows | length > 0 }}"
+          when: "{{ normalize_session.context.rows is defined and normalize_session.context.rows | length > 0 }}"
         - step: access_denied
-          when: "{{ get_user_from_session.command_0 is not defined or get_user_from_session.command_0.rows | length == 0 }}"
+          when: "{{ normalize_session.context.rows is not defined or normalize_session.context.rows | length == 0 }}"
 
   - step: check_permission
     desc: Check permissions
@@ -76,7 +134,7 @@ workflow:
         FROM auth.user_roles ur
         JOIN auth.roles r ON ur.role_id = r.role_id
         JOIN auth.playbook_permissions pp ON r.role_id = pp.role_id
-        WHERE ur.user_id = {{ get_user_from_session.command_0.rows[0].user_id }}
+        WHERE ur.user_id = {{ normalize_session.context.user.user_id }}
           AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
           AND (
             pp.playbook_path = ('{{ playbook_path | tojson | replace("'", "''") }}'::jsonb #>> '{}')
@@ -93,9 +151,9 @@ workflow:
         mode: exclusive
       arcs:
         - step: access_granted
-          when: "{{ check_permission.command_0 is defined and check_permission.command_0.rows | length > 0 and check_permission.command_0.rows[0].has_permission }}"
+          when: "{{ check_permission.context.rows is defined and check_permission.context.rows | length > 0 and check_permission.context.rows[0].has_permission }}"
         - step: access_denied
-          when: "{{ check_permission.command_0 is not defined or check_permission.command_0.rows | length == 0 or not check_permission.command_0.rows[0].has_permission }}"
+          when: "{{ check_permission.context.rows is not defined or check_permission.context.rows | length == 0 or not check_permission.context.rows[0].has_permission }}"
 
   - step: access_granted
     desc: Return allowed
@@ -104,9 +162,9 @@ workflow:
       input:
         playbook_path: "{{ playbook_path }}"
         action: "{{ action }}"
-        user_id: "{{ get_user_from_session.command_0.rows[0].user_id }}"
-        email: "{{ get_user_from_session.command_0.rows[0].email }}"
-        display_name: "{{ get_user_from_session.command_0.rows[0].display_name }}"
+        user_id: "{{ normalize_session.context.user.user_id }}"
+        email: "{{ normalize_session.context.user.email }}"
+        display_name: "{{ normalize_session.context.user.display_name }}"
       code: |
         result = {
             "allowed": True,
@@ -140,9 +198,9 @@ workflow:
           playbook_path: "{{ access_granted.playbook_path }}"
           permission_type: "{{ access_granted.action }}"
           user:
-            user_id: "{{ get_user_from_session.command_0.rows[0].user_id }}"
-            email: "{{ get_user_from_session.command_0.rows[0].email }}"
-            display_name: "{{ get_user_from_session.command_0.rows[0].display_name }}"
+            user_id: "{{ normalize_session.context.user.user_id }}"
+            email: "{{ normalize_session.context.user.email }}"
+            display_name: "{{ normalize_session.context.user.display_name }}"
           message: "{{ access_granted.message }}"
     next:
       spec:
