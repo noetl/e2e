@@ -180,11 +180,11 @@ workflow:
         mode: exclusive
       arcs:
         - step: get_user_roles
-          when: "{{ create_user_session.command_0 is defined }}"
+          when: "{{ create_user_session.rows is defined and create_user_session.rows | length > 0 }}"
         - step: send_db_error_callback
-          when: "{{ create_user_session.command_0 is not defined and request_id }}"
+          when: "{{ (create_user_session.rows is not defined or create_user_session.rows | length == 0) and request_id }}"
         - step: end
-          when: "{{ create_user_session.command_0 is not defined and not request_id }}"
+          when: "{{ (create_user_session.rows is not defined or create_user_session.rows | length == 0) and not request_id }}"
 
   - step: send_db_error_callback
     desc: Send database error callback to gateway
@@ -218,7 +218,7 @@ workflow:
         ) AS roles
         FROM auth.user_roles ur
         JOIN auth.roles r ON ur.role_id = r.role_id
-        WHERE ur.user_id = {{ create_user_session.command_0.rows[0].user_id }}
+        WHERE ur.user_id = {{ create_user_session.rows[0].user_id }}
           AND (ur.expires_at IS NULL OR ur.expires_at > NOW());
     next:
       spec:
@@ -233,8 +233,53 @@ workflow:
       libs:
         json: json
       code: |
-        session_row = context.get('create_user_session', {}).get('command_0', {}).get('rows', [{}])[0]
-        roles = context.get('get_user_roles', {}).get('command_0', {}).get('rows', [{}])[0].get('roles', [])
+        def rows_from_step(step_name, command_name=None):
+            def pick(obj, *keys):
+                current = obj
+                for key in keys:
+                    if current is None:
+                        return None
+                    if isinstance(current, dict):
+                        current = current.get(key)
+                        continue
+                    getter = getattr(current, "get", None)
+                    if callable(getter):
+                        try:
+                            current = getter(key)
+                            continue
+                        except Exception:
+                            pass
+                    try:
+                        current = getattr(current, key)
+                    except Exception:
+                        return None
+                return current
+
+            step = context.get(step_name, {}) or {}
+            candidates = [
+                pick(step, "rows"),
+                pick(step, "context", "rows"),
+                pick(step, "context", "_prev", "rows"),
+                pick(step, "data", "rows"),
+                pick(step, "data", "context", "rows"),
+            ]
+            if command_name:
+                candidates.extend([
+                    pick(step, command_name, "rows"),
+                    pick(step, "context", command_name, "rows"),
+                    pick(step, "context", "results", command_name, "rows"),
+                    pick(step, "data", command_name, "rows"),
+                    pick(step, "data", "context", "results", command_name, "rows"),
+                ])
+            for candidate in candidates:
+                if candidate:
+                    return candidate
+            return []
+
+        session_rows = rows_from_step("create_user_session", "create_user_session_task")
+        role_rows = rows_from_step("get_user_roles")
+        session_row = session_rows[0] if session_rows else {}
+        roles = (role_rows[0] if role_rows else {}).get('roles', [])
         if isinstance(roles, str):
             try:
                 roles = json.loads(roles)
@@ -276,8 +321,8 @@ workflow:
       auth: "{{ nats_credential }}"
       operation: kv_put
       bucket: "{{ session_bucket }}"
-      key: "{{ prepare_session_cache.session_cache.session_token }}"
-      value: "{{ prepare_session_cache.session_cache }}"
+      key: "{{ prepare_session_cache.context.session_cache.session_token }}"
+      value: "{{ prepare_session_cache.context.session_cache }}"
       spec:
         policy:
           rules:
@@ -309,9 +354,9 @@ workflow:
         status: "success"
         data:
           status: "authenticated"
-          session_token: "{{ prepare_session_cache.session_cache.session_token }}"
-          user: "{{ prepare_session_cache.user }}"
-          expires_at: "{{ prepare_session_cache.session_cache.expires_at }}"
+          session_token: "{{ prepare_session_cache.context.session_cache.session_token }}"
+          user: "{{ prepare_session_cache.context.user }}"
+          expires_at: "{{ prepare_session_cache.context.session_cache.expires_at }}"
     next:
       spec:
         mode: exclusive
