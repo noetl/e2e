@@ -51,11 +51,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURE_ROOT="$REPO_ROOT/fixtures/playbooks"
 
-# Use Rust CLI binary
-# Use noetl from PATH (installed via pip)
+# Use the maintained Rust CLI binary from PATH.
 NOETL_CLI="noetl"
 if ! command -v noetl >/dev/null 2>&1; then
-  echo "Error: noetl CLI not found. Install with: pip install noetl[cli]"
+  echo "Error: noetl CLI not found. Install with Homebrew/APT or build from https://github.com/noetl/cli"
   exit 1
 fi
 
