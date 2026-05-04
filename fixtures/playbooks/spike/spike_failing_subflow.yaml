@@ -1,0 +1,39 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: spike_failing_subflow
+  path: tests/spike/spike_failing_subflow
+  description: |
+    Deliberately-failing sub-playbook used by spike_e2e_test. Hits a
+    non-routable URL with no retry so the failure is fast and
+    deterministic — the smoke wants the failure path to be
+    consistent across runs, not a flaky upstream.
+
+    Not exposed as an MCP tool (no caller would invoke this on
+    purpose); kept private to the test suite via
+    `exposes_as_mcp: false`.
+
+  exposes_as_mcp: false
+  tags:
+    - test
+    - spike
+    - intentional-failure
+
+workflow:
+  - step: hit_non_routable
+    desc: HTTP GET against a non-routable host — fast, deterministic failure
+    tool:
+      kind: http
+      method: GET
+      # ``.invalid`` is a reserved TLD per RFC 2606 — guaranteed to
+      # never resolve, so this is the most reliable way to force a
+      # connection-refused / DNS-failed error in a test.
+      url: "http://this-host-deliberately-does-not-exist.invalid:1/test"
+      timeout_seconds: 2
+      # No retry — we want the failure surfaced immediately so the
+      # smoke doesn't burn time waiting through backoff.
+    next:
+      arcs:
+        - step: end
+
+  - step: end

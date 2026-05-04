@@ -1,0 +1,106 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: spike_e2e_test
+  path: tests/spike/spike_e2e_test
+  description: |
+    End-to-end smoke for the NoETL-as-AI-OS spike. Exercises all five
+    gaps in a single execution:
+
+    - **Gap 1** (`tool: agent framework=noetl`) — dispatches a peer
+      sub-playbook as the agent runtime
+    - **Gap 4.1** (auto-dispatch on failure) — `on_failure.troubleshoot:
+      true` on the agent step, so when the sub-playbook fails the
+      executor automatically invokes the troubleshoot agent against
+      the failed sub-execution_id
+    - **Gap 4** (self-troubleshoot agent) — the troubleshoot playbook
+      itself runs, fetching the failed execution's events and
+      classifying via Ollama
+    - **Gap 5** (mcp/ollama bridge) — the troubleshoot agent's
+      ollama_triage step calls the local Ollama bridge for first-pass
+      classification
+    - **Gap 3** (typed metadata) — `exposes_as_mcp: true` is validated
+      at register time as the typed Pydantic field
+
+    Gap 2 (playbook-as-MCP-server) is tested separately via curl in
+    the runbook playbook (since it's an external-protocol surface,
+    not a sub-flow callable).
+
+    Returns the agent envelope from the failed sub-call. The diagnosis
+    appears in `error.diagnosis` per the Gap 4.1 contract.
+
+  exposes_as_mcp: true
+  tags:
+    - test
+    - spike
+    - e2e
+    - ai-os
+
+workload:
+  # Pass-through to the troubleshoot agent's workload via `on_failure`.
+  # `escalate_to: none` keeps the smoke fast and free — Ollama-only
+  # path, no upstream API calls. Bump to 'openai' or 'claude' when
+  # validating the escalation paths separately.
+  ollama_model: "gemma2:2b"
+  confidence_threshold: 0.0
+  escalate_to: "none"
+
+workflow:
+  - step: trigger_failure
+    desc: Dispatch a deliberately-failing sub-playbook via tool agent framework=noetl
+    tool:
+      kind: agent
+      framework: noetl
+      entrypoint: tests/spike/spike_failing_subflow
+      payload: {}
+      # Gap 4.1: opt in to auto-troubleshoot. When the sub-playbook
+      # fails, the executor dispatches the troubleshoot agent against
+      # the failed sub-execution_id and attaches the diagnosis to
+      # error.diagnosis on the agent envelope.
+      on_failure:
+        troubleshoot: true
+        ollama_model: "{{ workload.ollama_model }}"
+        confidence_threshold: "{{ workload.confidence_threshold }}"
+        escalate_to: "{{ workload.escalate_to }}"
+    next:
+      arcs:
+        - step: extract_envelope
+
+  - step: extract_envelope
+    desc: Surface the agent envelope as a top-level result so the smoke can assert
+    tool:
+      kind: python
+      code: |
+        # `failed_envelope` is the agent envelope from trigger_failure.
+        # We expect:
+        #   - status: "error"
+        #   - framework: "noetl"
+        #   - error.kind: "agent.execution"
+        #   - error.code: "PLAYBOOK_FAILED"
+        #   - error.diagnosis: {...}  # Gap 4.1 hook attaches this
+        envelope = failed_envelope if isinstance(failed_envelope, dict) else {}
+        error_block = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+        diagnosis = error_block.get("diagnosis") if isinstance(error_block.get("diagnosis"), dict) else None
+
+        result = {
+          "status": "ok",
+          "smoke_status": "ok",
+          "agent_envelope": envelope,
+          "diagnosis": diagnosis,
+          # Convenience fields the assertion script reads
+          "summary": (
+            "Spike e2e smoke completed; diagnosis "
+            + ("attached" if diagnosis else "MISSING")
+          ),
+          "text": (
+            "Spike e2e smoke completed; diagnosis "
+            + ("attached" if diagnosis else "MISSING")
+          ),
+        }
+      args:
+        failed_envelope: "{{ trigger_failure }}"
+    next:
+      arcs:
+        - step: end
+
+  - step: end
