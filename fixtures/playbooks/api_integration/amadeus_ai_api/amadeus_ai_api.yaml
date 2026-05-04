@@ -296,10 +296,107 @@ workflow:
           - "GDS"
         searchCriteria:
           maxFlightOffers: 10
+      # Retry on transient upstream failures only — Amadeus's sandbox
+      # is intermittently 500 / 502 / 503 (we hit a 500 in execution
+      # 619156384600293663 with no payload issue on our side). 429 is
+      # rate-limit; the test API is throttled. Don't retry 4xx auth /
+      # bad-request errors — retrying just delays the failure message.
+      retry:
+        max_attempts: 3
+        retry_on_status: [429, 500, 502, 503, 504]
+        backoff_seconds: 2
     next:
       spec: { mode: exclusive }
       arcs:
+        # Happy path: response status 200/2xx — Amadeus returned offers.
         - step: log_amadeus_event
+          when: "{{ amadeus_search.status == 'COMPLETED' or (amadeus_search.data.status_code | default(0)) < 400 }}"
+        # Sad path: any 4xx/5xx after retries are exhausted, or the
+        # tool itself returned status='error'. Skip the rest of the
+        # workflow (which would burn OpenAI tokens translating an
+        # empty / error payload) and go straight to the friendly
+        # failure handler.
+        - step: handle_amadeus_failure
+          when: "{{ amadeus_search.status != 'COMPLETED' or (amadeus_search.data.status_code | default(0)) >= 400 }}"
+
+  - step: handle_amadeus_failure
+    desc: |
+      Surface a friendly error to the GUI when the Amadeus search
+      itself fails. Avoids running openai_translate_response /
+      extract_summary / persist_result on garbage data.
+    tool:
+      kind: python
+      input:
+        amadeus: "{{ amadeus_search }}"
+        query: "{{ workload.query }}"
+      code: |
+        # Pull what little we know about the failure into a structured
+        # message. The HTTP tool's error envelope carries
+        # data.status_code + data.headers + data.body (when the
+        # response was JSON-parseable); surface the most useful
+        # parts so the user sees more than "Tool returned error
+        # status".
+        if not isinstance(amadeus, dict):
+            amadeus = {}
+        data = amadeus.get("data") if isinstance(amadeus.get("data"), dict) else {}
+        status_code = data.get("status_code")
+        body = data.get("body") or data.get("response") or data.get("error")
+        if isinstance(body, dict):
+            errors = body.get("errors") if isinstance(body.get("errors"), list) else None
+            if errors:
+                body_msg = "; ".join(
+                    str(e.get("title") or e.get("detail") or e.get("message") or e)
+                    for e in errors
+                )
+            else:
+                body_msg = str(body)[:600]
+        elif isinstance(body, str):
+            body_msg = body[:600]
+        else:
+            body_msg = "(no response body captured)"
+
+        if status_code and 500 <= int(status_code) <= 599:
+            user_message = (
+                "The flight provider's search service is temporarily "
+                "unavailable. Please try again in a moment."
+            )
+        elif status_code == 429:
+            user_message = (
+                "We're being rate-limited by the flight provider. "
+                "Please try again in a few seconds."
+            )
+        elif status_code in (401, 403):
+            user_message = (
+                "Couldn't authenticate with the flight provider. "
+                "An operator may need to refresh credentials."
+            )
+        elif status_code in (400, 422):
+            user_message = (
+                "The flight search query couldn't be parsed by the "
+                "provider. Try rephrasing — include city pair, date, "
+                "and number of travelers."
+            )
+        else:
+            user_message = (
+                "The flight search failed. Please try again, "
+                "or contact support if the issue persists."
+            )
+
+        result = {
+            "status": "failed",
+            "stage": "amadeus_search",
+            "user_query": query,
+            "user_message": user_message,
+            "upstream_status_code": status_code,
+            "upstream_message": body_msg,
+            "raw_amadeus_envelope_keys": sorted(amadeus.keys()) if isinstance(amadeus, dict) else [],
+            "summary": user_message,
+            "text": user_message,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
 
   - step: log_amadeus_event
     desc: Log Amadeus search event
