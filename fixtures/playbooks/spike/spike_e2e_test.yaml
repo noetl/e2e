@@ -41,7 +41,8 @@ workload:
   # `escalate_to: none` keeps the smoke fast and free — Ollama-only
   # path, no upstream API calls. Bump to 'openai' or 'claude' when
   # validating the escalation paths separately.
-  ollama_model: "gemma2:2b"
+  ollama_model: "gemma3:4b"
+  noetl_url: "http://noetl.noetl.svc.cluster.local:8082"
   confidence_threshold: 0.0
   escalate_to: "none"
 
@@ -60,6 +61,7 @@ workflow:
       on_failure:
         troubleshoot: true
         ollama_model: "{{ workload.ollama_model }}"
+        noetl_url: "{{ workload.noetl_url }}"
         confidence_threshold: "{{ workload.confidence_threshold }}"
         escalate_to: "{{ workload.escalate_to }}"
     next:
@@ -78,15 +80,68 @@ workflow:
         #   - error.kind: "agent.execution"
         #   - error.code: "PLAYBOOK_FAILED"
         #   - error.diagnosis: {...}  # Gap 4.1 hook attaches this
+        import json
+        import os
+        import time
+        import urllib.request
+
         envelope = failed_envelope if isinstance(failed_envelope, dict) else {}
         error_block = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
         diagnosis = error_block.get("diagnosis") if isinstance(error_block.get("diagnosis"), dict) else None
+        diagnosis_lookup = {"attempts": 0, "status": "not-needed"}
+
+        required = {"category", "confidence", "root_cause", "suggested_action", "source"}
+
+        def _extract_persisted_diagnosis(doc):
+          events = doc.get("events", []) if isinstance(doc, dict) else []
+          for evt in events:
+            if not isinstance(evt, dict):
+              continue
+            if evt.get("node_name") != "persist_diagnosis":
+              continue
+            if evt.get("event_type") not in ("command.completed", "step.exit", "call.done"):
+              continue
+            result_block = evt.get("result") if isinstance(evt.get("result"), dict) else {}
+            ctx = result_block.get("context") if isinstance(result_block.get("context"), dict) else {}
+            candidate = ctx.get("diagnosis") if isinstance(ctx.get("diagnosis"), dict) else None
+            if candidate and {"category", "confidence", "root_cause", "suggested_action", "source"}.issubset(candidate.keys()):
+              return candidate
+          return None
+
+        # The auto-troubleshoot hook dispatches the diagnosis playbook.
+        # On async runtimes the envelope may initially contain only the
+        # dispatch handle. For the e2e smoke, wait briefly and surface
+        # the final persisted diagnosis so the assertion validates the
+        # whole AI-OS path instead of the launch acknowledgement.
+        if isinstance(diagnosis, dict) and not required.issubset(diagnosis.keys()):
+          diag_id = diagnosis.get("execution_id")
+          if diag_id:
+            base = str(os.environ.get("NOETL_SERVER_URL") or noetl_url).rstrip("/")
+            diagnosis_lookup = {"attempts": 0, "status": "waiting", "execution_id": diag_id, "base": base}
+            for attempt in range(30):
+              diagnosis_lookup["attempts"] = attempt + 1
+              try:
+                api_base = base if base.endswith("/api") else f"{base}/api"
+                with urllib.request.urlopen(f"{api_base}/executions/{diag_id}", timeout=5) as resp:
+                  doc = json.loads(resp.read().decode("utf-8"))
+                diagnosis_lookup["last_status"] = doc.get("status")
+                diagnosis_lookup["events"] = len(doc.get("events", []) if isinstance(doc.get("events"), list) else [])
+                final_diagnosis = _extract_persisted_diagnosis(doc)
+                if final_diagnosis:
+                  diagnosis = final_diagnosis
+                  diagnosis_lookup["status"] = "resolved"
+                  break
+              except Exception as exc:
+                diagnosis_lookup["status"] = "error"
+                diagnosis_lookup["error"] = str(exc)
+              time.sleep(2)
 
         result = {
           "status": "ok",
           "smoke_status": "ok",
           "agent_envelope": envelope,
           "diagnosis": diagnosis,
+          "diagnosis_lookup": diagnosis_lookup,
           # Convenience fields the assertion script reads
           "summary": (
             "Spike e2e smoke completed; diagnosis "
@@ -99,6 +154,7 @@ workflow:
         }
       args:
         failed_envelope: "{{ trigger_failure }}"
+        noetl_url: "{{ workload.noetl_url }}"
     next:
       arcs:
         - step: end
