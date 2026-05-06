@@ -41,20 +41,17 @@ workload:
   # `escalate_to: none` keeps the smoke fast and free — Ollama-only
   # path, no upstream API calls. Bump to 'openai' or 'claude' when
   # validating the escalation paths separately.
-  # `triage_*` fields are canonical. `ollama_*` aliases stay wired for
-  # one release cycle so already-deployed workers that forward only the
-  # old field names still exercise the same backend.
+  # `triage_*` fields are canonical. Workers v2.36.0+ forward them
+  # directly to the troubleshoot agent without deprecated ollama_* mirrors.
   triage_model: "gemma3:4b"
   triage_mcp_server: "mcp/ollama"
-  ollama_model: "gemma3:4b"
-  ollama_mcp_server: "mcp/ollama"
   noetl_url: "http://noetl.noetl.svc.cluster.local:8082"
   confidence_threshold: 0.0
   escalate_to: "none"
 
 workflow:
   - step: resolve_triage_backend
-    desc: Resolve canonical triage_* fields with deprecated ollama_* aliases
+    desc: Resolve canonical triage_* fields
     tool:
       kind: python
       code: |
@@ -62,38 +59,19 @@ workflow:
         DEFAULT_MODEL = "gemma3:4b"
 
         triage_server = str(triage_mcp_server or "").strip()
-        alias_server = str(ollama_mcp_server or "").strip()
         triage_model_value = str(triage_model or "").strip()
-        alias_model = str(ollama_model or "").strip()
 
-        if triage_server and (triage_server != DEFAULT_SERVER or not alias_server or alias_server == DEFAULT_SERVER):
-          server = triage_server
-        elif alias_server:
-          server = alias_server
-        else:
-          server = DEFAULT_SERVER
-
-        if triage_model_value and (triage_model_value != DEFAULT_MODEL or not alias_model or alias_model == DEFAULT_MODEL):
-          model = triage_model_value
-        elif alias_model:
-          model = alias_model
-        else:
-          model = DEFAULT_MODEL
+        server = triage_server or DEFAULT_SERVER
+        model = triage_model_value or DEFAULT_MODEL
 
         result = {
           "status": "ok",
           "server": server,
           "model": model,
-          "alias_used": {
-            "server": server == alias_server and alias_server != triage_server,
-            "model": model == alias_model and alias_model != triage_model_value,
-          },
         }
       args:
         triage_mcp_server: "{{ workload.triage_mcp_server }}"
-        ollama_mcp_server: "{{ workload.ollama_mcp_server }}"
         triage_model: "{{ workload.triage_model }}"
-        ollama_model: "{{ workload.ollama_model }}"
     next:
       arcs:
         - step: trigger_failure
@@ -113,8 +91,6 @@ workflow:
         troubleshoot: true
         triage_model: "{{ resolve_triage_backend.model }}"
         triage_mcp_server: "{{ resolve_triage_backend.server }}"
-        ollama_model: "{{ resolve_triage_backend.model }}"
-        ollama_mcp_server: "{{ resolve_triage_backend.server }}"
         noetl_url: "{{ workload.noetl_url }}"
         confidence_threshold: "{{ workload.confidence_threshold }}"
         escalate_to: "{{ workload.escalate_to }}"
