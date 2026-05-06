@@ -41,12 +41,63 @@ workload:
   # `escalate_to: none` keeps the smoke fast and free — Ollama-only
   # path, no upstream API calls. Bump to 'openai' or 'claude' when
   # validating the escalation paths separately.
+  # `triage_*` fields are canonical. `ollama_*` aliases stay wired for
+  # one release cycle so already-deployed workers that forward only the
+  # old field names still exercise the same backend.
+  triage_model: "gemma3:4b"
+  triage_mcp_server: "mcp/ollama"
   ollama_model: "gemma3:4b"
+  ollama_mcp_server: "mcp/ollama"
   noetl_url: "http://noetl.noetl.svc.cluster.local:8082"
   confidence_threshold: 0.0
   escalate_to: "none"
 
 workflow:
+  - step: resolve_triage_backend
+    desc: Resolve canonical triage_* fields with deprecated ollama_* aliases
+    tool:
+      kind: python
+      code: |
+        DEFAULT_SERVER = "mcp/ollama"
+        DEFAULT_MODEL = "gemma3:4b"
+
+        triage_server = str(triage_mcp_server or "").strip()
+        alias_server = str(ollama_mcp_server or "").strip()
+        triage_model_value = str(triage_model or "").strip()
+        alias_model = str(ollama_model or "").strip()
+
+        if triage_server and (triage_server != DEFAULT_SERVER or not alias_server or alias_server == DEFAULT_SERVER):
+          server = triage_server
+        elif alias_server:
+          server = alias_server
+        else:
+          server = DEFAULT_SERVER
+
+        if triage_model_value and (triage_model_value != DEFAULT_MODEL or not alias_model or alias_model == DEFAULT_MODEL):
+          model = triage_model_value
+        elif alias_model:
+          model = alias_model
+        else:
+          model = DEFAULT_MODEL
+
+        result = {
+          "status": "ok",
+          "server": server,
+          "model": model,
+          "alias_used": {
+            "server": server == alias_server and alias_server != triage_server,
+            "model": model == alias_model and alias_model != triage_model_value,
+          },
+        }
+      args:
+        triage_mcp_server: "{{ workload.triage_mcp_server }}"
+        ollama_mcp_server: "{{ workload.ollama_mcp_server }}"
+        triage_model: "{{ workload.triage_model }}"
+        ollama_model: "{{ workload.ollama_model }}"
+    next:
+      arcs:
+        - step: trigger_failure
+
   - step: trigger_failure
     desc: Dispatch a deliberately-failing sub-playbook via tool agent framework=noetl
     tool:
@@ -60,7 +111,10 @@ workflow:
       # error.diagnosis on the agent envelope.
       on_failure:
         troubleshoot: true
-        ollama_model: "{{ workload.ollama_model }}"
+        triage_model: "{{ resolve_triage_backend.model }}"
+        triage_mcp_server: "{{ resolve_triage_backend.server }}"
+        ollama_model: "{{ resolve_triage_backend.model }}"
+        ollama_mcp_server: "{{ resolve_triage_backend.server }}"
         noetl_url: "{{ workload.noetl_url }}"
         confidence_threshold: "{{ workload.confidence_threshold }}"
         escalate_to: "{{ workload.escalate_to }}"
@@ -136,6 +190,47 @@ workflow:
                 diagnosis_lookup["error"] = str(exc)
               time.sleep(2)
 
+        if diagnosis is None:
+          base = str(os.environ.get("NOETL_SERVER_URL") or noetl_url).rstrip("/")
+          diagnosis_lookup = {
+            "attempts": 0,
+            "status": "discovering-child-diagnosis",
+            "parent_execution_id": parent_execution_id,
+            "base": base,
+          }
+          for attempt in range(30):
+            diagnosis_lookup["attempts"] = attempt + 1
+            try:
+              api_base = base if base.endswith("/api") else f"{base}/api"
+              with urllib.request.urlopen(f"{api_base}/executions?limit=50", timeout=5) as resp:
+                listing = json.loads(resp.read().decode("utf-8"))
+              items = listing if isinstance(listing, list) else listing.get("items", [])
+              diag_id = None
+              for item in items:
+                if not isinstance(item, dict):
+                  continue
+                if item.get("parent_execution_id") != parent_execution_id:
+                  continue
+                if item.get("path") != "automation/agents/troubleshoot/diagnose_execution":
+                  continue
+                diag_id = item.get("execution_id")
+                break
+              if diag_id:
+                diagnosis_lookup["execution_id"] = diag_id
+                with urllib.request.urlopen(f"{api_base}/executions/{diag_id}", timeout=5) as resp:
+                  doc = json.loads(resp.read().decode("utf-8"))
+                diagnosis_lookup["last_status"] = doc.get("status")
+                diagnosis_lookup["events"] = len(doc.get("events", []) if isinstance(doc.get("events"), list) else [])
+                final_diagnosis = _extract_persisted_diagnosis(doc)
+                if final_diagnosis:
+                  diagnosis = final_diagnosis
+                  diagnosis_lookup["status"] = "resolved"
+                  break
+            except Exception as exc:
+              diagnosis_lookup["status"] = "error"
+              diagnosis_lookup["error"] = str(exc)
+            time.sleep(2)
+
         result = {
           "status": "ok",
           "smoke_status": "ok",
@@ -155,6 +250,7 @@ workflow:
       args:
         failed_envelope: "{{ trigger_failure }}"
         noetl_url: "{{ workload.noetl_url }}"
+        parent_execution_id: "{{ execution_id }}"
     next:
       arcs:
         - step: end
