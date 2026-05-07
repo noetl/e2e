@@ -1,181 +1,155 @@
 # PFT Flow Test Playbook
 
-End-to-end integration test that reproduces the full patient-data fetch pipeline from
-`state_report_generation_prod_v13`, without Snowflake. Designed to surface the
-loop.done concurrent-dispatch race bug present in NoETL ≤ v2.14.7.
+End-to-end integration test that reproduces the full patient-data fetch
+pipeline from `state_report_generation_prod_v13`, without Snowflake. The main
+flow is intentionally action-controlled: NoETL `http` actions fetch fixture
+data, NoETL `postgres` actions claim and persist rows, and task-sequence
+policies own retry and jump behavior.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `test_pft_flow.yaml` | Main playbook — facility loop, patient batching, 5 fetch steps, MDS batching, validation |
-| `test_mds_batch_worker.yaml` | Sub-playbook — fetches MDS assessment details for one OFFSET/LIMIT slice |
-| `pft_queue_db_maintenance.yaml` | Optional one-time queue maintenance for an already-used `demo_noetl` database |
+| `test_pft_flow.yaml` | Main playbook: action-controlled batch queue, fixture HTTP fetches, Postgres persistence, validation |
+| `test_mds_batch_worker.yaml` | Legacy focused MDS worker fixture; the main flow processes MDS through the same action-controlled batch queue |
+| `pft_queue_db_maintenance.yaml` | Optional operator maintenance for already-bloated queue tables |
 
-## What it tests
+## What It Tests
 
-The critical code path: DB-based patient batching using a `NOT EXISTS` + `INSERT RETURNING LIMIT 100`
-CTE that atomically claims patients into `pft_test_patient_fetch_status` (tombstones). When the
-loop.done race fires prematurely, subsequent batches have tombstones inserted but their fetch loop
-is never started — patients are silently lost.
+The critical code path is execution-scoped DB batch claiming plus declared
+NoETL tool actions. Each worker slot claims one bounded batch from
+`pft_test_work_batch_queue`, fetches a normalized fixture batch through the
+`http` tool, persists explicit rows through the `postgres` tool, and uses
+task-sequence `jump` control to claim more work until the queue drains.
 
-Pass criterion: every facility shows `1000/1000` patients in all five result tables.
-Any shortfall means the race bug is still present.
+This keeps the benchmark under the NoETL tool/action control plane. The main
+flow does not hand database credentials to Python and does not hide the patient
+loop inside an arbitrary script.
 
-## Test parameters
+Pass criterion: every facility shows `1000/1000` patients in all five result
+tables, and MDS expected/detail counts match. Any shortfall means the workflow
+lost patients or skipped detail rows.
+
+## Test Parameters
 
 | Parameter | Value |
 |---|---|
 | Facilities | 10 |
-| Patients per facility | 1 000 |
-| Total patients | 10 000 |
-| Batch size (patients) | 100 (LIMIT 100 per CTE claim) |
-| Batches per facility per data type | 10 |
-| Page size (API) | 10 records/page |
+| Patients per facility | 1,000 |
+| Total patients | 10,000 |
+| Batch size | 100 patients (`pft_batch_size`) |
+| Batch concurrency | 16 action slots (`pft_batch_concurrency`) |
+| Batches per data type | 100 for 10k patients |
+| Page size | 10 records/page |
 
-## Data flow
+## Data Flow
 
-```
+```text
 start
-  └─ load_next_facility                    # pick lowest active facility
-       └─ setup_facility_work              # TRUNCATE work, DELETE tombstones, seed 1000 patients
-            └─ load_patients_for_assessments  ──┐
-                 ├─ fetch_assessments ──(loop.done)─┘   # paginated 2-4 pages
-                 └─ load_patients_for_conditions    ──┐
-                      ├─ fetch_conditions ──(loop.done)─┘  # paginated 1-3 pages
-                      └─ load_patients_for_medications ──┐
-                           ├─ fetch_medications ──(loop.done)─┘  # paginated 2-3 pages
-                           └─ load_patients_for_vital_signs ──┐
-                                ├─ fetch_vital_signs ──(loop.done)─┘  # always 1 page
-                                └─ load_patients_for_demographics ──┐
-                                     ├─ fetch_demographics ──(loop.done)─┘  # non-paginated
-                                     └─ count_mds_assessments
-                                          └─ prepare_mds_work
-                                               └─ build_mds_batch_plan
-                                                    └─ run_mds_batch_workers  # sub-playbook loop
-                                                         └─ validate_facility_results
-                                                              └─ log_facility_validation
-                                                                   └─ mark_facility_processed
-                                                                        ├─ load_next_facility  (more facilities)
-                                                                        └─ validate_all_results (done)
-                                                                             └─ check_results
-                                                                                  └─ end
+  -> setup_facility_work
+       seed patients
+       seed pft_test_patient_work_queue
+       seed pft_test_work_batch_queue
+  -> process_pft_action_batches
+       16 parallel slots:
+         claim_batch  (postgres, SKIP LOCKED)
+         fetch_batch  (http, /api/v1/pft/batch/{data_type})
+         save_batch   (postgres, jsonb_to_recordset upserts)
+         jump claim_batch until no pending batches
+  -> validate_all_results
+  -> check_results
+  -> end
 ```
 
-## Fetch step pattern
+The older per-patient cursor steps remain lower in `test_pft_flow.yaml` as
+historical fixtures, but the main route enters `process_pft_action_batches`.
 
-Each `fetch_*` step runs a `task_sequence` loop over the claimed patient batch.
-On `loop.done` it routes back to the corresponding `load_patients_for_*` step,
-which either claims the next batch (row_count > 0 → fetch again) or exits the
-data-type chain (row_count == 0 → next data type).
+## Action-Batch Pattern
 
-The loopback arc uses `when: '{{ event.name == "loop.done" }}'` — this is the fix
-for the v2.14.7 bug where every `call.done` evaluated the arc and `mode: exclusive`
-silently dropped all but the first dispatch.
+`process_pft_action_batches` is a task-sequence loop over a bounded set of
+worker slots:
+
+1. `claim_batch` (`postgres`): atomically claims the next pending
+   `(data_type, batch_id)` using `FOR UPDATE SKIP LOCKED`.
+2. `fetch_batch` (`http`): calls `/api/v1/pft/batch/{data_type}` with the
+   claimed patient IDs. The fixture server normalizes paginated domains,
+   demographics, and MDS into explicit row arrays.
+3. `save_batch` (`postgres`): persists rows using `jsonb_to_recordset`, marks
+   patient queue rows done for the five patient domains, and marks the batch
+   done.
+4. `jump claim_batch`: keeps the slot draining work until `claim_batch` returns
+   no rows and breaks.
+
+The fixture server endpoint caps a single HTTP batch at 500 patient IDs. The
+playbook default uses 100 to keep Postgres upserts and response payloads
+bounded.
 
 ## Validation
 
-`validate_facility_results` counts `DISTINCT pcc_patient_id` from each **result table**
-(not tombstones) and `COUNT(*)` from `pft_test_patient_fetch_status` for comparison:
+`validate_all_results` counts `DISTINCT pcc_patient_id` from each result table
+and compares the assessment queue-done count for the current execution:
 
 ```sql
-SELECT
-  COUNT(DISTINCT pcc_patient_id) FROM pft_test_patient_assessments  -- actual data
-  ...
-  COUNT(DISTINCT pcc_patient_id) FROM pft_test_patient_fetch_status -- tombstones
-WHERE facility_mapping_id = N AND data_type = 'assessments';
+SELECT COUNT(DISTINCT pcc_patient_id)
+FROM public.pft_test_patient_assessments;
+
+SELECT COUNT(DISTINCT patient_id)
+FROM public.pft_test_patient_work_queue
+WHERE execution_id = '<execution_id>'
+  AND data_type = 'assessments'
+  AND status = 'done';
 ```
 
-On a buggy engine: `tombstones = 1000`, `assessments_done = 100–200` (one or two batches only).
-On a fixed engine: both equal `1000`.
+For each facility, all five patient domains must have exactly 1,000 distinct
+patients. MDS expected/detail counts must match.
 
-Results are written to `pft_test_validation_log` and asserted in `check_results`.
+## Infrastructure Requirements
 
-## Infrastructure requirements
+- NoETL server/worker with task-sequence `jump` and Postgres/HTTP tools enabled.
+- PostgreSQL via `pg_k8s` credential.
+- Test API server in the `test-server` namespace on port 5555, serving
+  `/api/v1/pft/batch/{data_type}`.
+- On GKE, use a public, versioned `ghcr.io/noetl/test-server:<tag>` image.
 
-- **NoETL server** ≥ v2.14.8 (for `try_claim_loop_done` CAS fix)
-- **PostgreSQL** via `pg_k8s` credential (`postgres.postgres.svc.cluster.local:5432`, database `demo_noetl`)
-- **Test API server** (`paginated-api` deployment in `test-server` namespace, port 5555)
-  — serves deterministic per-patient responses for all 7 endpoints used by the fetch steps
-
-## Running the test
-
-### Preferred (CLI, validated on v2.23.0)
+## Running The Test
 
 Use the catalog path without the `.yaml` extension:
 
 ```bash
-noetl execute playbook fixtures/playbooks/pft_flow_test/test_pft_flow
+noetl exec fixtures/playbooks/pft_flow_test/test_pft_flow --runtime distributed
 ```
 
-Notes:
-
-- Using the `.yaml` suffix with `noetl execute playbook` can return `404 Playbook not found` on server-backed execution.
-- `noetl execute playbook fixtures/playbooks/pft_flow_test/test_pft_flow` starts successfully on v2.23.0.
-
-### HTTP API fallback
-
-If you need explicit catalog version control, register and execute via API:
+For smaller smoke runs, override workload values:
 
 ```bash
-# Register (bump version each time the playbook changes)
-curl -X POST http://localhost:8082/api/catalog \
-     -H "Content-Type: application/json" \
-     -d @fixtures/playbooks/pft_flow_test/test_pft_flow.yaml
-
-# Execute
-curl -X POST http://localhost:8082/api/execute \
-     -H "Content-Type: application/json" \
-     -d '{"path": "fixtures/playbooks/pft_flow_test/test_pft_flow", "version": <N>}'
+noetl exec fixtures/playbooks/pft_flow_test/test_pft_flow \
+  --runtime distributed \
+  --payload '{"num_facilities":1,"patients_per_facility":100,"pft_batch_size":25,"pft_batch_concurrency":4}'
 ```
 
 Check results after completion:
 
 ```sql
-SELECT facility_mapping_id, assessments_done, conditions_done, medications_done,
-       vital_signs_done, demographics_done, total_expected, tombstones_assessments
+SELECT facility_mapping_id,
+       assessments_done,
+       conditions_done,
+       medications_done,
+       vital_signs_done,
+       demographics_done,
+       mds_expected,
+       mds_details_done
 FROM public.pft_test_validation_log
 WHERE execution_id = '<execution_id>'
 ORDER BY facility_mapping_id;
 ```
 
-## Optional queue maintenance
+## Optional Queue Maintenance
 
-If the demo database has already seen a long-running or cancelled PFT workload and
-you want to clean up queue-table bloat before the next benchmark slice, run the
-companion maintenance playbook first. It uses Python + `psycopg` with autocommit,
-so it can safely execute `CREATE INDEX CONCURRENTLY` and `VACUUM`, which are not a
-good fit for the main reset-heavy fixture setup step.
+If the demo database has already seen a long-running or cancelled PFT workload
+and you want to clean up queue-table bloat before the next benchmark slice, run
+the companion maintenance playbook first. It uses Python + `psycopg` with
+autocommit so it can safely execute `CREATE INDEX CONCURRENTLY` and `VACUUM`,
+which are not a good fit for the main reset-heavy fixture setup step.
 
-```bash
-curl -X POST http://localhost:8082/api/catalog \
-  -H "Content-Type: application/json" \
-  -d @fixtures/playbooks/pft_flow_test/pft_queue_db_maintenance.yaml
-
-curl -X POST http://localhost:8082/api/execute \
-  -H "Content-Type: application/json" \
-  -d '{"path": "fixtures/playbooks/pft_flow_test/pft_queue_db_maintenance", "version": <N>}'
-```
-
-## MDS sub-playbook
-
-`test_mds_batch_worker` is invoked once per OFFSET/LIMIT slice of `pft_test_mds_assessment_ids_work`.
-It fetches assessment details from `/api/v1/mds/assessment/{id}` and upserts into
-`pft_test_mds_assessment_details`. Called with `max_in_flight: 1` from the parent to keep
-concurrency predictable during testing.
-
-### How it is called from the main playbook
-
-`test_pft_flow.yaml` calls this sub-playbook from `run_mds_batch_workers` using `execute_playbook`
-for each generated batch (`offset`, `batch_size`, `batch_number`).
-
-For each call:
-
-- A child execution is created in `noetl.execution`.
-- The child row has `parent_execution_id = <main_execution_id>`.
-- Child events are written to `noetl.event` with the child `execution_id`.
-- Parent and child command metadata can be correlated through command lifecycle events and,
-  on newer builds, records in the `commands` table.
-
-This parent/child chain is the most reliable way to produce a full execution report for the
-fixture, especially when `run_mds_batch_workers` fans out many sub-playbook calls.
+This is an explicit operator maintenance action; it is not part of the PFT
+processing path.

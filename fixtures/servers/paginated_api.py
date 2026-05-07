@@ -1015,6 +1015,109 @@ def get_mds_assessment_detail(assessment_id: str):
     }
 
 
+def _pft_facility_mapping_id(patient_id: int, patients_per_facility: int) -> int:
+    return ((patient_id - 1) // max(1, patients_per_facility)) + 1
+
+
+def _pft_batch_patient_ids(patientIds: str) -> list[int]:
+    ids: list[int] = []
+    for raw in patientIds.split(","):
+        text = raw.strip()
+        if not text:
+            continue
+        ids.append(int(text))
+    if not ids:
+        raise HTTPException(status_code=400, detail="patientIds must contain at least one patient id")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="patientIds batch size must be <= 500")
+    return ids
+
+
+@app.get('/api/v1/pft/batch/{data_type}')
+def get_pft_batch(
+    data_type: str,
+    patientIds: str = Query(..., description="Comma-separated patient IDs"),
+    pageSize: int = Query(default=10, ge=1),
+    patientsPerFacility: int = Query(default=1000, ge=1),
+):
+    """Return normalized PFT rows for a bounded batch of patient IDs.
+
+    This endpoint is intentionally fixture-scoped. It lets NoETL playbooks keep
+    high-throughput orchestration inside declared `http` + `postgres` actions
+    instead of handing broad database credentials to arbitrary Python code.
+    """
+    patient_ids = _pft_batch_patient_ids(patientIds)
+    rows = []
+
+    if data_type in {"assessments", "conditions", "medications", "vital_signs"}:
+        page_bounds = {
+            "assessments": (2, 4),
+            "conditions": (1, 3),
+            "medications": (2, 3),
+            "vital_signs": (1, 1),
+        }
+        min_pages, max_pages = page_bounds[data_type]
+        for patient_id in patient_ids:
+            total_pages = _pft_page_count(str(patient_id), data_type, min_pages, max_pages)
+            facility_mapping_id = _pft_facility_mapping_id(patient_id, patientsPerFacility)
+            for page in range(1, total_pages + 1):
+                rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "facility_mapping_id": facility_mapping_id,
+                        "page_number": page,
+                        "payload": {
+                            "data": _pft_records(str(patient_id), data_type, page, pageSize),
+                            "paging": {
+                                "hasMore": page < total_pages,
+                                "page": page,
+                                "pageSize": pageSize,
+                                "total": total_pages * pageSize,
+                            },
+                        },
+                        "is_last_page": page == total_pages,
+                    }
+                )
+    elif data_type == "demographics":
+        for patient_id in patient_ids:
+            seed = int(hashlib.md5(f"{patient_id}:demographics".encode()).hexdigest(), 16)
+            rows.append(
+                {
+                    "patient_id": patient_id,
+                    "facility_mapping_id": _pft_facility_mapping_id(patient_id, patientsPerFacility),
+                    "payload": {
+                        "patientId": str(patient_id),
+                        "firstName": f"First{seed % 1000}",
+                        "lastName": f"Last{(seed >> 8) % 1000}",
+                        "dob": f"19{50 + seed % 50}-{1 + seed % 12:02d}-{1 + (seed >> 4) % 28:02d}",
+                        "gender": "M" if seed % 2 == 0 else "F",
+                        "status": "active",
+                    },
+                }
+            )
+    elif data_type == "mds":
+        for patient_id in patient_ids:
+            assessment_last_page = _pft_page_count(str(patient_id), "assessments", 2, 4)
+            assessment_id = f"MDS-{patient_id}-{assessment_last_page}"
+            rows.append(
+                {
+                    "patient_id": patient_id,
+                    "facility_mapping_id": _pft_facility_mapping_id(patient_id, patientsPerFacility),
+                    "assessment_id": assessment_id,
+                    "payload": get_mds_assessment_detail(assessment_id),
+                }
+            )
+    else:
+        raise HTTPException(status_code=400, detail=f"unsupported PFT batch data_type: {data_type}")
+
+    return {
+        "dataType": data_type,
+        "patientCount": len(patient_ids),
+        "rowCount": len(rows),
+        "rows": rows,
+    }
+
+
 @app.get('/health')
 def health():
     """Health check endpoint."""
