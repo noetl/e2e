@@ -12,10 +12,11 @@ metadata:
 
     Setup:
     - 10 facilities, 1000 patients each = 10 000 patients total
-    - Each facility requires 10 batches of 100 per data type
-    - 4 paginated fetch steps (assessments 2-4p, conditions 1-3p, medications 2-3p,
-      vital_signs 1p always) + 1 non-paginated (demographics)
-    - MDS cursor fetch/save for assessment detail rows
+    - Work is claimed in execution-scoped batches and processed only through
+      declared NoETL actions: http fetches from the fixture server, postgres
+      persists explicit result sets, and task_sequence policies control retry.
+    - 4 paginated data types (assessments 2-4p, conditions 1-3p,
+      medications 2-3p, vital_signs 1p always) + demographics + MDS details.
     - All test tables are prefixed pft_test_* in public schema
 
     Go/no-go criterion: validate_facility_results shows 1000/1000 per facility for all
@@ -26,15 +27,9 @@ workload:
   page_size: 10
   num_facilities: 10
   patients_per_facility: 1000
-  pft_worker_threads: 64
-  pft_insert_chunk_size: 1000
-  pg_host: pgbouncer.postgres.svc.cluster.local
-  pg_port: 5432
-  pg_user: demo
-  pg_password: demo
-  pg_database: demo_noetl
-  claim_batch_size: 1000
-  batch_slots: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
+  pft_batch_size: 100
+  pft_batch_concurrency: 16
+  batch_slots: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
 workflow:
   # ------------------------------------------------------------------
@@ -100,6 +95,34 @@ workflow:
         -- use pft_queue_db_maintenance for live DB tuning on existing tables.
         CREATE INDEX IF NOT EXISTS idx_pft_queue_claimed_reclaim
           ON public.pft_test_patient_work_queue (execution_id, data_type, claimed_at, facility_mapping_id, patient_id)
+          WHERE status = 'claimed';
+
+        -- Execution-scoped batch queue. The hot path claims bounded batches
+        -- with postgres actions, fetches them with http actions, and persists
+        -- result rows with postgres actions. No Python worker receives direct
+        -- database credentials.
+        CREATE TABLE IF NOT EXISTS public.pft_test_work_batch_queue (
+          execution_id  TEXT        NOT NULL,
+          data_type     TEXT        NOT NULL,
+          batch_id      INTEGER     NOT NULL,
+          patient_ids   INTEGER[]   NOT NULL,
+          status        TEXT        NOT NULL DEFAULT 'pending',
+          attempt_count INTEGER     NOT NULL DEFAULT 0,
+          worker_id     TEXT,
+          claimed_at    TIMESTAMPTZ,
+          done_at       TIMESTAMPTZ,
+          last_error    TEXT,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (execution_id, data_type, batch_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pft_batch_queue_pending
+          ON public.pft_test_work_batch_queue (execution_id, batch_id, data_type)
+          WHERE status = 'pending';
+
+        CREATE INDEX IF NOT EXISTS idx_pft_batch_queue_claimed_reclaim
+          ON public.pft_test_work_batch_queue (execution_id, claimed_at, batch_id, data_type)
           WHERE status = 'claimed';
 
         -- Autovacuum tuning for high-churn work queue: vacuum at 2% dead
@@ -248,6 +271,7 @@ workflow:
 
         -- Reset all per-run data (truncate keeps tables small and inserts fast)
         TRUNCATE public.pft_test_patient_work_queue;
+        TRUNCATE public.pft_test_work_batch_queue;
         TRUNCATE public.pft_test_patient_ids_work;
         TRUNCATE public.pft_test_patient_assessments;
         TRUNCATE public.pft_test_patient_conditions;
@@ -351,6 +375,45 @@ workflow:
         ) AS t(data_type)
         ON CONFLICT (execution_id, facility_mapping_id, data_type, patient_id) DO NOTHING;
 
+        -- Seed bounded batches for the action-controlled high-throughput path.
+        -- This keeps orchestration observable in NoETL while avoiding one
+        -- command per patient/page.
+        WITH ordered_patients AS (
+          SELECT
+            patient_id,
+            ROW_NUMBER() OVER (
+              ORDER BY ((patient_id - 1) % {{ workload.patients_per_facility | int }}), facility_mapping_id
+            ) AS rn
+          FROM public.pft_test_patient_ids_work
+        ),
+        batches AS (
+          SELECT
+            (((rn - 1) / {{ workload.pft_batch_size | int }})::INTEGER + 1) AS batch_id,
+            ARRAY_AGG(patient_id ORDER BY rn) AS patient_ids
+          FROM ordered_patients
+          GROUP BY (((rn - 1) / {{ workload.pft_batch_size | int }})::INTEGER + 1)
+        )
+        INSERT INTO public.pft_test_work_batch_queue (
+          execution_id, data_type, batch_id, patient_ids, status
+        )
+        SELECT
+          '{{ execution_id }}',
+          d.data_type,
+          b.batch_id,
+          b.patient_ids,
+          'pending'
+        FROM batches b
+        CROSS JOIN (
+          VALUES
+            ('assessments'),
+            ('conditions'),
+            ('medications'),
+            ('vital_signs'),
+            ('demographics'),
+            ('mds')
+        ) AS d(data_type)
+        ON CONFLICT (execution_id, data_type, batch_id) DO NOTHING;
+
         -- Reset global barrier rows in case of replay.
         DELETE FROM public.pft_test_facility_data_type_done
         WHERE execution_id = '{{ execution_id }}';
@@ -361,262 +424,338 @@ workflow:
         SELECT COUNT(*) AS patient_count
         FROM public.pft_test_patient_ids_work;
     next:
-      # The high-throughput path intentionally uses one bulk Python worker
-      # command. Patient-level cursor workers are kept below as reference
-      # fixtures, but 10k patients across five domains otherwise creates
-      # enough NoETL command/event pressure to dominate the actual HTTP work.
       spec:
         mode: exclusive
       arcs:
-        - step: process_pft_bulk
+        - step: process_pft_action_batches
 
-  - step: process_pft_bulk
+  - step: process_pft_action_batches
     desc: |
-      End-to-end high-throughput PFT processor. It still calls the test-server
-      HTTP API for every patient/domain/page, but it performs the inner
-      patient loop inside one NoETL command and bulk-upserts results with
-      psycopg. This avoids using the NoETL command dispatcher as a per-patient
-      work queue, which is the bottleneck for the 10k-under-hour target.
+      End-to-end high-throughput PFT processor using declared NoETL actions.
+      Each slot repeatedly claims one bounded batch, fetches a fixture batch
+      over HTTP, persists the explicit rows through the postgres tool, and
+      jumps back to claim more work until the batch queue drains.
+    loop:
+      in: '{{ workload.batch_slots }}'
+      iterator: slot
+      spec:
+        mode: parallel
+        max_in_flight: '{{ workload.pft_batch_concurrency | int }}'
     tool:
-      kind: python
-      libs:
-        psycopg: psycopg
-      input:
-        api_url: '{{ api_url }}'
-        page_size: '{{ page_size }}'
-        threads: '{{ workload.pft_worker_threads }}'
-        chunk_size: '{{ workload.pft_insert_chunk_size }}'
-        patients_per_facility: '{{ workload.patients_per_facility }}'
-        pg_host: '{{ workload.pg_host }}'
-        pg_port: '{{ workload.pg_port }}'
-        pg_user: '{{ workload.pg_user }}'
-        pg_password: '{{ workload.pg_password }}'
-        pg_database: '{{ workload.pg_database }}'
-        execution_id: '{{ execution_id }}'
-      code: |
-        import json
-        import time
-        import urllib.parse
-        import urllib.request
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        import psycopg
-        from psycopg.types.json import Jsonb
-
-        api = (api_url or "").rstrip("/")
-        page_size = int(page_size or 10)
-        threads = max(1, int(threads or 32))
-        chunk_size = max(100, int(chunk_size or 1000))
-        patients_per_facility = max(1, int(patients_per_facility or 1000))
-        timeout = 8
-        started = time.time()
-
-        conninfo = (
-            f"host={pg_host} port={pg_port or 5432} user={pg_user} "
-            f"password={pg_password} dbname={pg_database}"
-        )
-
-        def fetch_json(path, params=None):
-            url = api + path
-            if params:
-                url += "?" + urllib.parse.urlencode(params)
-            with urllib.request.urlopen(url, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-
-        def pages_for(patient_id, data_type):
-            path = f"/api/v1/patient/{data_type}"
-            page = 1
-            rows = []
-            while True:
-                payload = fetch_json(
-                    path,
-                    {"patientId": str(patient_id), "page": page, "pageSize": page_size},
-                )
-                paging = payload.get("paging") or {}
-                rows.append((page, payload, not bool(paging.get("hasMore"))))
-                if not paging.get("hasMore"):
-                    return rows
-                page += 1
-
-        def process_patient(row):
-            patient_id, facility_mapping_id = row
-            out = {
-                "assessments": [],
-                "conditions": [],
-                "medications": [],
-                "vital_signs": [],
-                "demographics": None,
-                "mds_id": None,
-                "mds_detail": None,
-            }
-            for data_type in ("assessments", "conditions", "medications", "vital_signs"):
-                out[data_type] = pages_for(patient_id, data_type)
-
-            out["demographics"] = fetch_json(
-                "/api/v1/patient/demographics", {"patientId": str(patient_id)}
-            )
-
-            assessment_last_page = out["assessments"][-1][0]
-            assessment_id = f"MDS-{patient_id}-{assessment_last_page}"
-            out["mds_id"] = assessment_id
-            out["mds_detail"] = fetch_json(f"/api/v1/mds/assessment/{assessment_id}")
-            return patient_id, facility_mapping_id, out
-
-        def chunks(seq, size):
-            for idx in range(0, len(seq), size):
-                yield seq[idx: idx + size]
-
-        # NoETL executes Python snippets with separate globals/locals. Functions
-        # used by ThreadPoolExecutor resolve helper names through globals, so
-        # publish the locally-defined helpers before worker threads start.
-        globals().update(locals())
-
-        with psycopg.connect(conninfo) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT patient_id, facility_mapping_id
-                    FROM public.pft_test_patient_ids_work
-                    ORDER BY ((patient_id - 1) %% %s), facility_mapping_id
-                    """,
-                    (patients_per_facility,),
-                )
-                patients = cur.fetchall()
-
-        assessments = []
-        conditions = []
-        medications = []
-        vital_signs = []
-        demographics = []
-        mds_ids = []
-        mds_details = []
-        failures = []
-
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            futures = [pool.submit(process_patient, row) for row in patients]
-            for future in as_completed(futures):
-                try:
-                    patient_id, facility_mapping_id, data = future.result()
-                except Exception as exc:
-                    failures.append(str(exc))
-                    continue
-
-                for page, payload, is_last_page in data["assessments"]:
-                    assessments.append((patient_id, facility_mapping_id, page, Jsonb(payload), is_last_page))
-                for page, payload, is_last_page in data["conditions"]:
-                    conditions.append((patient_id, facility_mapping_id, page, Jsonb(payload), is_last_page))
-                for page, payload, is_last_page in data["medications"]:
-                    medications.append((patient_id, facility_mapping_id, page, Jsonb(payload), is_last_page))
-                for page, payload, is_last_page in data["vital_signs"]:
-                    vital_signs.append((patient_id, facility_mapping_id, page, Jsonb(payload), is_last_page))
-                demographics.append((patient_id, facility_mapping_id, Jsonb(data["demographics"])))
-                mds_ids.append((data["mds_id"], patient_id, facility_mapping_id, "done"))
-                mds_details.append((data["mds_id"], patient_id, facility_mapping_id, Jsonb(data["mds_detail"])))
-
-        if failures:
-            raise RuntimeError(f"{len(failures)} patient fetches failed; first={failures[0]}")
-
-        with psycopg.connect(conninfo) as conn:
-            with conn.cursor() as cur:
-                for table, rows in (
-                    ("pft_test_patient_assessments", assessments),
-                    ("pft_test_patient_conditions", conditions),
-                    ("pft_test_patient_medications", medications),
-                    ("pft_test_patient_vital_signs", vital_signs),
-                ):
-                    sql = f"""
-                        INSERT INTO public.{table}
-                          (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number)
-                        DO UPDATE SET payload = EXCLUDED.payload,
-                                      is_last_page = EXCLUDED.is_last_page
-                    """
-                    for part in chunks(rows, chunk_size):
-                        cur.executemany(sql, part)
-
-                for part in chunks(demographics, chunk_size):
-                    cur.executemany(
-                        """
-                        INSERT INTO public.pft_test_patient_demographics
-                          (pcc_patient_id, facility_mapping_id, payload)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (pcc_patient_id, facility_mapping_id)
-                        DO UPDATE SET payload = EXCLUDED.payload,
-                                      fetched_at = NOW()
-                        """,
-                        part,
-                    )
-
-                for part in chunks(mds_ids, chunk_size):
-                    cur.executemany(
-                        """
-                        INSERT INTO public.pft_test_mds_assessment_ids_work
-                          (assessment_id, pcc_patient_id, facility_mapping_id, status, done_at, updated_at)
-                        VALUES (%s, %s, %s, %s, NOW(), NOW())
-                        ON CONFLICT (assessment_id)
-                        DO UPDATE SET status = EXCLUDED.status,
-                                      done_at = NOW(),
-                                      updated_at = NOW()
-                        """,
-                        part,
-                    )
-
-                for part in chunks(mds_details, chunk_size):
-                    cur.executemany(
-                        """
-                        INSERT INTO public.pft_test_mds_assessment_details
-                          (assessment_id, pcc_patient_id, facility_mapping_id, payload)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (assessment_id)
-                        DO UPDATE SET payload = EXCLUDED.payload,
-                                      fetched_at = NOW()
-                        """,
-                        part,
-                    )
-
-                cur.execute(
-                    """
-                    UPDATE public.pft_test_patient_work_queue
-                    SET status = 'done',
-                        done_at = NOW(),
-                        worker_id = NULL,
-                        claimed_at = NULL,
-                        updated_at = NOW()
-                    WHERE execution_id = %s
-                    """,
-                    (execution_id,),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO public.pft_test_facility_data_type_done
-                      (execution_id, facility_mapping_id, data_type, done_at)
-                    SELECT %s, 0, data_type, NOW()
-                    FROM (VALUES
-                      ('assessments'), ('conditions'), ('medications'),
-                      ('vital_signs'), ('demographics')
-                    ) AS d(data_type)
-                    ON CONFLICT (execution_id, facility_mapping_id, data_type) DO NOTHING
-                    """,
-                    (execution_id,),
-                )
-                conn.commit()
-
-        elapsed = time.time() - started
-        result = {
-            "status": "ok",
-            "patients": len(patients),
-            "elapsed_seconds": round(elapsed, 3),
-            "threads": threads,
-            "rows": {
-                "assessments": len(assessments),
-                "conditions": len(conditions),
-                "medications": len(medications),
-                "vital_signs": len(vital_signs),
-                "demographics": len(demographics),
-                "mds_details": len(mds_details),
-            },
-        }
+      - name: claim_batch
+        kind: postgres
+        auth: pg_k8s
+        command: |
+          WITH reclaim_stale AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'pending',
+                claimed_at = NULL,
+                worker_id = NULL,
+                updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND status = 'claimed'
+              AND claimed_at < NOW() - INTERVAL '5 minutes'
+          ),
+          candidate AS (
+            SELECT data_type, batch_id, patient_ids
+            FROM public.pft_test_work_batch_queue
+            WHERE execution_id = '{{ execution_id }}'
+              AND status = 'pending'
+            ORDER BY batch_id, data_type
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+          )
+          UPDATE public.pft_test_work_batch_queue q
+          SET status = 'claimed',
+              attempt_count = q.attempt_count + 1,
+              worker_id = 'action-batch:{{ slot }}',
+              claimed_at = NOW(),
+              updated_at = NOW(),
+              last_error = NULL
+          FROM candidate c
+          WHERE q.execution_id = '{{ execution_id }}'
+            AND q.data_type = c.data_type
+            AND q.batch_id = c.batch_id
+          RETURNING
+            q.data_type,
+            q.batch_id,
+            ARRAY_TO_STRING(q.patient_ids, ',') AS patient_ids_csv,
+            CARDINALITY(q.patient_ids) AS patient_count;
+        spec:
+          policy:
+            rules:
+              - when: '{{ (output.data.row_count | default(0) | int) == 0 }}'
+                then:
+                  do: break
+              - else:
+                  then:
+                    do: continue
+                    set:
+                      iter.data_type: '{{ output.data.rows[0].data_type }}'
+                      iter.batch_id: '{{ output.data.rows[0].batch_id }}'
+                      iter.patient_ids_csv: '{{ output.data.rows[0].patient_ids_csv }}'
+                      iter.patient_count: '{{ output.data.rows[0].patient_count }}'
+      - name: fetch_batch
+        kind: http
+        method: GET
+        url: '{{ api_url }}/api/v1/pft/batch/{{ iter.data_type }}'
+        timeout: 30
+        params:
+          patientIds: '{{ iter.patient_ids_csv }}'
+          pageSize: '{{ page_size }}'
+          patientsPerFacility: '{{ workload.patients_per_facility }}'
+        spec:
+          policy:
+            rules:
+              - when: '{{ output.status == "error" }}'
+                then:
+                  do: retry
+                  attempts: 3
+              - else:
+                  then:
+                    do: continue
+                    set:
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+                      iter.batch_row_count: '{{ output.data.data.rowCount }}'
+      - name: save_batch
+        kind: postgres
+        auth: pg_k8s
+        command: |
+          {% if iter.data_type == 'assessments' %}
+          WITH src AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id INTEGER, facility_mapping_id INTEGER, page_number INTEGER, payload JSONB, is_last_page BOOLEAN)
+          ),
+          save_rows AS (
+            INSERT INTO public.pft_test_patient_assessments
+              (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM src
+            ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              is_last_page = EXCLUDED.is_last_page
+            RETURNING 1
+          ),
+          mark_queue AS (
+            UPDATE public.pft_test_patient_work_queue q
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            FROM (SELECT DISTINCT patient_id, facility_mapping_id FROM src) s
+            WHERE q.execution_id = '{{ execution_id }}'
+              AND q.data_type = 'assessments'
+              AND q.patient_id = s.patient_id
+              AND q.facility_mapping_id = s.facility_mapping_id
+            RETURNING 1
+          ),
+          mark_batch AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = '{{ iter.data_type }}'
+              AND batch_id = {{ iter.batch_id | int }}
+            RETURNING 1
+          )
+          SELECT (SELECT COUNT(*) FROM save_rows) AS rows_saved,
+                 (SELECT COUNT(*) FROM mark_queue) AS queue_done,
+                 (SELECT COUNT(*) FROM mark_batch) AS batch_done;
+          {% elif iter.data_type == 'conditions' %}
+          WITH src AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id INTEGER, facility_mapping_id INTEGER, page_number INTEGER, payload JSONB, is_last_page BOOLEAN)
+          ),
+          save_rows AS (
+            INSERT INTO public.pft_test_patient_conditions
+              (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM src
+            ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              is_last_page = EXCLUDED.is_last_page
+            RETURNING 1
+          ),
+          mark_queue AS (
+            UPDATE public.pft_test_patient_work_queue q
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            FROM (SELECT DISTINCT patient_id, facility_mapping_id FROM src) s
+            WHERE q.execution_id = '{{ execution_id }}'
+              AND q.data_type = 'conditions'
+              AND q.patient_id = s.patient_id
+              AND q.facility_mapping_id = s.facility_mapping_id
+            RETURNING 1
+          ),
+          mark_batch AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = '{{ iter.data_type }}'
+              AND batch_id = {{ iter.batch_id | int }}
+            RETURNING 1
+          )
+          SELECT (SELECT COUNT(*) FROM save_rows) AS rows_saved,
+                 (SELECT COUNT(*) FROM mark_queue) AS queue_done,
+                 (SELECT COUNT(*) FROM mark_batch) AS batch_done;
+          {% elif iter.data_type == 'medications' %}
+          WITH src AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id INTEGER, facility_mapping_id INTEGER, page_number INTEGER, payload JSONB, is_last_page BOOLEAN)
+          ),
+          save_rows AS (
+            INSERT INTO public.pft_test_patient_medications
+              (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM src
+            ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              is_last_page = EXCLUDED.is_last_page
+            RETURNING 1
+          ),
+          mark_queue AS (
+            UPDATE public.pft_test_patient_work_queue q
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            FROM (SELECT DISTINCT patient_id, facility_mapping_id FROM src) s
+            WHERE q.execution_id = '{{ execution_id }}'
+              AND q.data_type = 'medications'
+              AND q.patient_id = s.patient_id
+              AND q.facility_mapping_id = s.facility_mapping_id
+            RETURNING 1
+          ),
+          mark_batch AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = '{{ iter.data_type }}'
+              AND batch_id = {{ iter.batch_id | int }}
+            RETURNING 1
+          )
+          SELECT (SELECT COUNT(*) FROM save_rows) AS rows_saved,
+                 (SELECT COUNT(*) FROM mark_queue) AS queue_done,
+                 (SELECT COUNT(*) FROM mark_batch) AS batch_done;
+          {% elif iter.data_type == 'vital_signs' %}
+          WITH src AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id INTEGER, facility_mapping_id INTEGER, page_number INTEGER, payload JSONB, is_last_page BOOLEAN)
+          ),
+          save_rows AS (
+            INSERT INTO public.pft_test_patient_vital_signs
+              (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM src
+            ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              is_last_page = EXCLUDED.is_last_page
+            RETURNING 1
+          ),
+          mark_queue AS (
+            UPDATE public.pft_test_patient_work_queue q
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            FROM (SELECT DISTINCT patient_id, facility_mapping_id FROM src) s
+            WHERE q.execution_id = '{{ execution_id }}'
+              AND q.data_type = 'vital_signs'
+              AND q.patient_id = s.patient_id
+              AND q.facility_mapping_id = s.facility_mapping_id
+            RETURNING 1
+          ),
+          mark_batch AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = '{{ iter.data_type }}'
+              AND batch_id = {{ iter.batch_id | int }}
+            RETURNING 1
+          )
+          SELECT (SELECT COUNT(*) FROM save_rows) AS rows_saved,
+                 (SELECT COUNT(*) FROM mark_queue) AS queue_done,
+                 (SELECT COUNT(*) FROM mark_batch) AS batch_done;
+          {% elif iter.data_type == 'demographics' %}
+          WITH src AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id INTEGER, facility_mapping_id INTEGER, payload JSONB)
+          ),
+          save_rows AS (
+            INSERT INTO public.pft_test_patient_demographics
+              (pcc_patient_id, facility_mapping_id, payload)
+            SELECT patient_id, facility_mapping_id, payload
+            FROM src
+            ON CONFLICT (pcc_patient_id, facility_mapping_id) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              fetched_at = NOW()
+            RETURNING 1
+          ),
+          mark_queue AS (
+            UPDATE public.pft_test_patient_work_queue q
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            FROM (SELECT DISTINCT patient_id, facility_mapping_id FROM src) s
+            WHERE q.execution_id = '{{ execution_id }}'
+              AND q.data_type = 'demographics'
+              AND q.patient_id = s.patient_id
+              AND q.facility_mapping_id = s.facility_mapping_id
+            RETURNING 1
+          ),
+          mark_batch AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = '{{ iter.data_type }}'
+              AND batch_id = {{ iter.batch_id | int }}
+            RETURNING 1
+          )
+          SELECT (SELECT COUNT(*) FROM save_rows) AS rows_saved,
+                 (SELECT COUNT(*) FROM mark_queue) AS queue_done,
+                 (SELECT COUNT(*) FROM mark_batch) AS batch_done;
+          {% else %}
+          WITH src AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id INTEGER, facility_mapping_id INTEGER, assessment_id TEXT, payload JSONB)
+          ),
+          save_ids AS (
+            INSERT INTO public.pft_test_mds_assessment_ids_work
+              (assessment_id, pcc_patient_id, facility_mapping_id, status, done_at, updated_at)
+            SELECT assessment_id, patient_id, facility_mapping_id, 'done', NOW(), NOW()
+            FROM src
+            ON CONFLICT (assessment_id) DO UPDATE SET
+              status = EXCLUDED.status,
+              done_at = NOW(),
+              updated_at = NOW()
+            RETURNING 1
+          ),
+          save_details AS (
+            INSERT INTO public.pft_test_mds_assessment_details
+              (assessment_id, pcc_patient_id, facility_mapping_id, payload)
+            SELECT assessment_id, patient_id, facility_mapping_id, payload
+            FROM src
+            ON CONFLICT (assessment_id) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              fetched_at = NOW()
+            RETURNING 1
+          ),
+          mark_batch AS (
+            UPDATE public.pft_test_work_batch_queue
+            SET status = 'done', done_at = NOW(), worker_id = NULL, claimed_at = NULL, updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = '{{ iter.data_type }}'
+              AND batch_id = {{ iter.batch_id | int }}
+            RETURNING 1
+          )
+          SELECT (SELECT COUNT(*) FROM save_details) AS rows_saved,
+                 0 AS queue_done,
+                 (SELECT COUNT(*) FROM mark_batch) AS batch_done;
+          {% endif %}
+        spec:
+          policy:
+            rules:
+              - when: '{{ output.status == "error" }}'
+                then:
+                  do: retry
+                  attempts: 3
+              - else:
+                  then:
+                    do: jump
+                    to: claim_batch
     next:
       spec:
         mode: exclusive
@@ -1945,50 +2084,40 @@ workflow:
       policy-output shape regression in wait_for_mds_completion and prevents a
       partial MDS count from being recorded as a successful facility result.
     tool:
-      kind: python
-      input:
-        row: '{{ validate_facility_results.rows[0] }}'
-        expected_patients: '{{ workload.patients_per_facility }}'
-      code: |
-        def _to_int(v):
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return 0
+      kind: postgres
+      auth: pg_k8s
+      command: |
+        DO $$
+        DECLARE
+          expected INTEGER := {{ workload.patients_per_facility | int }};
+          failures TEXT[];
+        BEGIN
+          SELECT ARRAY_REMOVE(ARRAY[
+            CASE WHEN {{ validate_facility_results.rows[0].assessments_done | int }} <> expected THEN 'assessments_done' END,
+            CASE WHEN {{ validate_facility_results.rows[0].conditions_done | int }} <> expected THEN 'conditions_done' END,
+            CASE WHEN {{ validate_facility_results.rows[0].medications_done | int }} <> expected THEN 'medications_done' END,
+            CASE WHEN {{ validate_facility_results.rows[0].vital_signs_done | int }} <> expected THEN 'vital_signs_done' END,
+            CASE WHEN {{ validate_facility_results.rows[0].demographics_done | int }} <> expected THEN 'demographics_done' END,
+            CASE WHEN {{ validate_facility_results.rows[0].assessments_queue_done | int }} <> expected THEN 'assessments_queue_done' END,
+            CASE WHEN {{ validate_facility_results.rows[0].mds_expected | int }} <> {{ validate_facility_results.rows[0].mds_details_done | int }} THEN 'mds_details_done' END
+          ], NULL) INTO failures;
 
-        expected = _to_int(expected_patients)
-        checks = {
-            "assessments_done": expected,
-            "conditions_done": expected,
-            "medications_done": expected,
-            "vital_signs_done": expected,
-            "demographics_done": expected,
-            "assessments_queue_done": expected,
-        }
-        failures = []
-        for key, want in checks.items():
-            got = _to_int(row.get(key))
-            if got != want:
-                failures.append(f"{key}={got} expected={want}")
+          IF ARRAY_LENGTH(failures, 1) IS NOT NULL THEN
+            RAISE EXCEPTION 'Facility validation is incomplete: %', ARRAY_TO_STRING(failures, ', ');
+          END IF;
+        END $$;
 
-        mds_expected = _to_int(row.get("mds_expected"))
-        mds_done = _to_int(row.get("mds_details_done"))
-        if mds_expected != mds_done:
-            failures.append(f"mds_details_done={mds_done} expected={mds_expected}")
-
-        assert not failures, "Facility validation is incomplete: " + "; ".join(failures)
-        result = {
-            "status": "ready",
-            "facility_mapping_id": _to_int(row.get("facility_mapping_id")),
-            "assessments_done": _to_int(row.get("assessments_done")),
-            "conditions_done": _to_int(row.get("conditions_done")),
-            "medications_done": _to_int(row.get("medications_done")),
-            "vital_signs_done": _to_int(row.get("vital_signs_done")),
-            "demographics_done": _to_int(row.get("demographics_done")),
-            "assessments_queue_done": _to_int(row.get("assessments_queue_done")),
-            "mds_expected": mds_expected,
-            "mds_details_done": mds_done,
-        }
+        SELECT
+          'ready' AS status,
+          {{ validate_facility_results.rows[0].facility_mapping_id | int }} AS facility_mapping_id,
+          {{ validate_facility_results.rows[0].assessments_done | int }} AS assessments_done,
+          {{ validate_facility_results.rows[0].conditions_done | int }} AS conditions_done,
+          {{ validate_facility_results.rows[0].medications_done | int }} AS medications_done,
+          {{ validate_facility_results.rows[0].vital_signs_done | int }} AS vital_signs_done,
+          {{ validate_facility_results.rows[0].demographics_done | int }} AS demographics_done,
+          {{ validate_facility_results.rows[0].assessments_queue_done | int }} AS assessments_queue_done,
+          {{ validate_facility_results.rows[0].mds_expected | int }} AS mds_expected,
+          {{ validate_facility_results.rows[0].mds_details_done | int }} AS mds_details_done;
     next:
       spec:
         mode: exclusive
@@ -2011,19 +2140,19 @@ workflow:
             vital_signs_done, demographics_done, assessments_queue_done,
             mds_expected, mds_details_done, total_expected
           )
-          VALUES (
-            '{{ execution_id }}',
-            {{ assert_facility_validation_ready.facility_mapping_id | int }},
-            {{ assert_facility_validation_ready.assessments_done | int }},
-            {{ assert_facility_validation_ready.conditions_done | int }},
-            {{ assert_facility_validation_ready.medications_done | int }},
-            {{ assert_facility_validation_ready.vital_signs_done | int }},
-            {{ assert_facility_validation_ready.demographics_done | int }},
-            {{ assert_facility_validation_ready.assessments_queue_done | int }},
-            {{ assert_facility_validation_ready.mds_expected | int }},
-            {{ assert_facility_validation_ready.mds_details_done | int }},
-            ({{ workload.num_facilities | int }} * {{ workload.patients_per_facility | int }})
-          )
+                  VALUES (
+                    '{{ execution_id }}',
+                    {{ assert_facility_validation_ready.rows[0].facility_mapping_id | int }},
+                    {{ assert_facility_validation_ready.rows[0].assessments_done | int }},
+                    {{ assert_facility_validation_ready.rows[0].conditions_done | int }},
+                    {{ assert_facility_validation_ready.rows[0].medications_done | int }},
+                    {{ assert_facility_validation_ready.rows[0].vital_signs_done | int }},
+                    {{ assert_facility_validation_ready.rows[0].demographics_done | int }},
+                    {{ assert_facility_validation_ready.rows[0].assessments_queue_done | int }},
+                    {{ assert_facility_validation_ready.rows[0].mds_expected | int }},
+                    {{ assert_facility_validation_ready.rows[0].mds_details_done | int }},
+                    ({{ workload.num_facilities | int }} * {{ workload.patients_per_facility | int }})
+                  )
           ON CONFLICT (execution_id, facility_mapping_id) DO UPDATE SET
           assessments_done       = EXCLUDED.assessments_done,
           conditions_done        = EXCLUDED.conditions_done,
@@ -2156,74 +2285,79 @@ workflow:
       If the 2.14.7 loop.done race bug is present, assessments_queue_done may be 1000
       but assessments_done will be << 1000 (only ~1 batch worth, due to premature cutoff).
     tool:
-      kind: python
-      input:
-        results: '{{ ctx.final_validation_rows | default([]) }}'
-        expected_facilities: 10
-        expected_patients: 1000
-      code: |
-        rows = results if isinstance(results, list) else []
-        expected_f = int(expected_facilities or 10)
-        expected_p = int(expected_patients or 1000)
-
-        print(f"[CHECK] {len(rows)} facilities in validation log (expected {expected_f})")
-
-        failures = []
-
-        if len(rows) != expected_f:
-            failures.append(
-                f"Expected {expected_f} facilities in log, got {len(rows)} — "
-                "execution may have stalled due to loop.done race"
+      kind: postgres
+      auth: pg_k8s
+      command: |
+        DO $$
+        DECLARE
+          failure_count INTEGER;
+          facility_count INTEGER;
+        BEGIN
+          WITH validation AS (
+            SELECT *
+            FROM JSONB_TO_RECORDSET('{{ ctx.final_validation_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(
+                facility_mapping_id INTEGER,
+                assessments_done INTEGER,
+                conditions_done INTEGER,
+                medications_done INTEGER,
+                vital_signs_done INTEGER,
+                demographics_done INTEGER,
+                assessments_queue_done INTEGER,
+                mds_expected INTEGER,
+                mds_details_done INTEGER,
+                total_expected INTEGER,
+                all_passed BOOLEAN
+              )
+          )
+          SELECT
+            COUNT(*),
+            COUNT(*) FILTER (
+              WHERE NOT (
+                assessments_done = {{ workload.patients_per_facility | int }}
+                AND conditions_done = {{ workload.patients_per_facility | int }}
+                AND medications_done = {{ workload.patients_per_facility | int }}
+                AND vital_signs_done = {{ workload.patients_per_facility | int }}
+                AND demographics_done = {{ workload.patients_per_facility | int }}
+                AND assessments_queue_done = {{ workload.patients_per_facility | int }}
+                AND mds_expected = mds_details_done
+              )
             )
+          INTO facility_count, failure_count
+          FROM validation;
 
-        for r in rows:
-            fid = r.get("facility_mapping_id")
-            queue_done = int(r.get("assessments_queue_done") or 0)
-            for dtype in ["assessments_done", "conditions_done", "medications_done",
-                          "vital_signs_done", "demographics_done"]:
-                count = int(r.get(dtype) or 0)
-                if count != expected_p:
-                    note = ""
-                    if dtype == "assessments_done" and queue_done > count:
-                        note = f" [RACE BUG: {queue_done} queue-done but only {count} fetched]"
-                    failures.append(
-                        f"facility={fid} {dtype}={count} (expected {expected_p}){note}"
-                    )
+          IF facility_count <> {{ workload.num_facilities | int }} THEN
+            RAISE EXCEPTION 'Expected % facilities, got %', {{ workload.num_facilities | int }}, facility_count;
+          END IF;
 
-            mds_expected = int(r.get("mds_expected") or 0)
-            mds_done = int(r.get("mds_details_done") or 0)
-            if mds_expected != mds_done:
-                failures.append(
-                    f"facility={fid} mds_details_done={mds_done} (expected {mds_expected})"
-                )
+          IF failure_count > 0 THEN
+            RAISE EXCEPTION 'Patient loss detected in % facility result(s)', failure_count;
+          END IF;
+        END $$;
 
-        assert not failures, (
-            f"Patient loss detected in {len(failures)} case(s):\n" + "\n".join(failures)
-        )
-
-        result = {
-            "status": "passed",
-            "facilities_checked": len(rows),
-            "patients_per_facility": expected_p,
-            "all_data_types_complete": True,
-            "mds_complete": True,
-        }
+        SELECT
+          'passed' AS status,
+          {{ workload.num_facilities | int }} AS facilities_checked,
+          {{ workload.patients_per_facility | int }} AS patients_per_facility,
+          TRUE AS all_data_types_complete,
+          TRUE AS mds_complete;
     next:
       spec:
         mode: exclusive
       arcs:
         - step: end
     set:
-      ctx.final_check_status: '{{ output.status }}'
+      ctx.final_check_status: '{{ output.data.rows[0].status }}'
 
   - step: end
     desc: PFT flow test complete — all facilities and patients processed
     tool:
-      kind: python
-      input:
-        check_status: '{{ ctx.final_check_status | default("unknown") }}'
-      code: |
-        result = {
-            "status": "completed" if check_status == "ok" else "failed",
-            "check_status": check_status,
-        }
+      kind: postgres
+      auth: pg_k8s
+      query: |
+        SELECT
+          CASE WHEN '{{ ctx.final_check_status | default("unknown") }}' = 'passed'
+            THEN 'completed'
+            ELSE 'failed'
+          END AS status,
+          '{{ ctx.final_check_status | default("unknown") }}' AS check_status;
