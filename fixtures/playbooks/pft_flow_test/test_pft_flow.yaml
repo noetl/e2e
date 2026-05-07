@@ -189,13 +189,17 @@ workflow:
           vital_signs_done       INTEGER,
           demographics_done      INTEGER,
           assessments_queue_done INTEGER,
+          mds_expected           INTEGER,
+          mds_details_done       INTEGER,
           total_expected         INTEGER,
           logged_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY (execution_id, facility_mapping_id)
         );
         -- Add columns if missing (for reruns on existing table)
         ALTER TABLE public.pft_test_validation_log
-          ADD COLUMN IF NOT EXISTS assessments_queue_done INTEGER;
+          ADD COLUMN IF NOT EXISTS assessments_queue_done INTEGER,
+          ADD COLUMN IF NOT EXISTS mds_expected INTEGER,
+          ADD COLUMN IF NOT EXISTS mds_details_done INTEGER;
 
         -- Per-facility data-type completion facts.
         -- Each of the 5 parallel data-type pipelines INSERTs one row when its
@@ -1527,7 +1531,7 @@ workflow:
 
         total = _to_int(total_count, 0)
         fid = _to_int(facility_mapping_id, 0)
-        batch_size = 50
+        batch_size = 25
         batches = []
         for idx in range(0, total, batch_size):
             batch_number = (idx // batch_size) + 1
@@ -1562,22 +1566,20 @@ workflow:
       max_in_flight intentionally set LOW (5) because tool.kind: playbook
       with a return_step blocks the worker slot for the entire sub-playbook
       duration (see noetl/worker/nats_worker.py:_execute_playbook polling
-      loop).  Each sub-playbook internally runs a 5-wide parallel fetch
-      loop, so 5 parent slots × ~5 child slots ≈ 25 active commands —
-      safely under 3 workers × 16 in-flight = 48 total capacity.  Setting
-      this higher (e.g. 100) deadlocks: parent polls exhaust all worker
-      slots before any child can claim.
+      loop). Each sub-playbook internally runs a 5-wide parallel fetch loop;
+      keep parent fan-out at 1 so the blocking parent poll cannot starve
+      child HTTP/save commands on GKE.
     loop:
       in: '{{ build_mds_batch_plan.batches }}'
       iterator: batch
       spec:
         mode: parallel
-        max_in_flight: 5
+        max_in_flight: 1
     tool:
       kind: playbook
       path: fixtures/playbooks/pft_flow_test/test_mds_batch_worker
       return_step: end
-      timeout: 300
+      timeout: 900
       input:
         pg_auth: pg_k8s
         api_url: '{{ api_url }}'
@@ -1589,8 +1591,48 @@ workflow:
       spec:
         mode: exclusive
       arcs:
-        - step: validate_facility_results
+        - step: wait_for_mds_completion
           when: '{{ event.name == "loop.done" }}'
+
+  - step: wait_for_mds_completion
+    desc: |
+      Gate facility validation on MDS detail completeness. The MDS sub-playbook
+      loop can report loop.done while late child writes are still landing; this
+      bounded wait makes that visible and prevents partial MDS from passing
+      silently. Defaults allow up to ~10 minutes for late MDS detail writes.
+    tool:
+      kind: postgres
+      auth: pg_k8s
+      query: |
+        WITH counts AS (
+          SELECT
+            (SELECT COUNT(*) FROM public.pft_test_mds_assessment_ids_work
+             WHERE facility_mapping_id = ({{ ctx.facility_mapping_id | int }})) AS mds_expected,
+            (SELECT COUNT(*) FROM public.pft_test_mds_assessment_details
+             WHERE facility_mapping_id = ({{ ctx.facility_mapping_id | int }})) AS mds_details_done
+        )
+        SELECT
+          mds_expected,
+          mds_details_done,
+          (mds_expected = mds_details_done) AS mds_complete
+        FROM counts;
+      spec:
+        policy:
+          rules:
+            - when: '{{ ((output.data.rows | default(output.data) | first).mds_complete | string | lower) != "true" }}'
+              then:
+                do: retry
+                attempts: 120
+                backoff: none
+                delay: 5.0
+            - else:
+                then:
+                  do: continue
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: validate_facility_results
 
   # ------------------------------------------------------------------
   # FACILITY VALIDATION + COMPLETION
@@ -1608,6 +1650,7 @@ workflow:
       auth: pg_k8s
       query: |
         SELECT
+          ({{ ctx.facility_mapping_id | int }}) AS facility_mapping_id,
           (SELECT COUNT(DISTINCT pcc_patient_id) FROM public.pft_test_patient_assessments
            WHERE facility_mapping_id = ({{ ctx.facility_mapping_id | int }})) AS assessments_done,
           (SELECT COUNT(DISTINCT pcc_patient_id) FROM public.pft_test_patient_conditions
@@ -1622,7 +1665,56 @@ workflow:
            WHERE execution_id = '{{ execution_id }}'
              AND facility_mapping_id = ({{ ctx.facility_mapping_id | int }})
              AND data_type = 'assessments'
-             AND status = 'done') AS assessments_queue_done;
+             AND status = 'done') AS assessments_queue_done,
+          (SELECT COUNT(*) FROM public.pft_test_mds_assessment_ids_work
+           WHERE facility_mapping_id = ({{ ctx.facility_mapping_id | int }})) AS mds_expected,
+          (SELECT COUNT(*) FROM public.pft_test_mds_assessment_details
+           WHERE facility_mapping_id = ({{ ctx.facility_mapping_id | int }})) AS mds_details_done;
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: assert_facility_validation_ready
+
+  - step: assert_facility_validation_ready
+    desc: |
+      Hard guard before writing the validation log. This catches any future
+      policy-output shape regression in wait_for_mds_completion and prevents a
+      partial MDS count from being recorded as a successful facility result.
+    tool:
+      kind: python
+      input:
+        row: '{{ validate_facility_results.rows[0] }}'
+        expected_patients: '{{ workload.patients_per_facility }}'
+      code: |
+        def _to_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
+
+        expected = _to_int(expected_patients)
+        checks = {
+            "assessments_done": expected,
+            "conditions_done": expected,
+            "medications_done": expected,
+            "vital_signs_done": expected,
+            "demographics_done": expected,
+            "assessments_queue_done": expected,
+        }
+        failures = []
+        for key, want in checks.items():
+            got = _to_int(row.get(key))
+            if got != want:
+                failures.append(f"{key}={got} expected={want}")
+
+        mds_expected = _to_int(row.get("mds_expected"))
+        mds_done = _to_int(row.get("mds_details_done"))
+        if mds_expected != mds_done:
+            failures.append(f"mds_details_done={mds_done} expected={mds_expected}")
+
+        assert not failures, "Facility validation is incomplete: " + "; ".join(failures)
+        result = {"status": "ready", "mds_expected": mds_expected, "mds_details_done": mds_done}
     next:
       spec:
         mode: exclusive
@@ -1641,17 +1733,20 @@ workflow:
         INSERT INTO public.pft_test_validation_log (
           execution_id, facility_mapping_id,
           assessments_done, conditions_done, medications_done,
-          vital_signs_done, demographics_done, assessments_queue_done, total_expected
+          vital_signs_done, demographics_done, assessments_queue_done,
+          mds_expected, mds_details_done, total_expected
         )
         VALUES (
           '{{ execution_id }}',
-          ({{ ctx.facility_mapping_id | int }}),
+          {{ validate_facility_results.rows[0].facility_mapping_id | default(0) }},
           {{ validate_facility_results.rows[0].assessments_done | default(0) }},
           {{ validate_facility_results.rows[0].conditions_done | default(0) }},
           {{ validate_facility_results.rows[0].medications_done | default(0) }},
           {{ validate_facility_results.rows[0].vital_signs_done | default(0) }},
           {{ validate_facility_results.rows[0].demographics_done | default(0) }},
           {{ validate_facility_results.rows[0].assessments_queue_done | default(0) }},
+          {{ validate_facility_results.rows[0].mds_expected | default(0) }},
+          {{ validate_facility_results.rows[0].mds_details_done | default(0) }},
           1000
         )
         ON CONFLICT (execution_id, facility_mapping_id) DO UPDATE SET
@@ -1661,6 +1756,8 @@ workflow:
           vital_signs_done       = EXCLUDED.vital_signs_done,
           demographics_done      = EXCLUDED.demographics_done,
           assessments_queue_done = EXCLUDED.assessments_queue_done,
+          mds_expected           = EXCLUDED.mds_expected,
+          mds_details_done       = EXCLUDED.mds_details_done,
           logged_at              = NOW();
 
         SELECT 'logged' AS status;
@@ -1678,7 +1775,7 @@ workflow:
       command: |
         UPDATE public.pft_test_facilities
         SET active = FALSE, updated_at = NOW()
-        WHERE facility_mapping_id = ({{ ctx.facility_mapping_id | int }});
+        WHERE facility_mapping_id = {{ validate_facility_results.rows[0].facility_mapping_id | default(0) }};
 
         SELECT COUNT(*) AS remaining_count FROM public.pft_test_facilities WHERE active = TRUE;
     next:
@@ -1709,12 +1806,15 @@ workflow:
           vital_signs_done,
           demographics_done,
           assessments_queue_done,
+          mds_expected,
+          mds_details_done,
           total_expected,
           (assessments_done = total_expected
            AND conditions_done = total_expected
            AND medications_done = total_expected
            AND vital_signs_done = total_expected
-           AND demographics_done = total_expected) AS all_passed
+           AND demographics_done = total_expected
+           AND mds_expected = mds_details_done) AS all_passed
         FROM public.pft_test_validation_log
         WHERE execution_id = '{{ execution_id }}'
         ORDER BY facility_mapping_id;
@@ -1766,6 +1866,13 @@ workflow:
                         f"facility={fid} {dtype}={count} (expected {expected_p}){note}"
                     )
 
+            mds_expected = int(r.get("mds_expected") or 0)
+            mds_done = int(r.get("mds_details_done") or 0)
+            if mds_expected != mds_done:
+                failures.append(
+                    f"facility={fid} mds_details_done={mds_done} (expected {mds_expected})"
+                )
+
         assert not failures, (
             f"Patient loss detected in {len(failures)} case(s):\n" + "\n".join(failures)
         )
@@ -1775,6 +1882,7 @@ workflow:
             "facilities_checked": len(rows),
             "patients_per_facility": expected_p,
             "all_data_types_complete": True,
+            "mds_complete": True,
         }
     next:
       spec:
