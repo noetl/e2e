@@ -1,0 +1,453 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: widget_all_types
+  path: tests/gui/widget_all_types
+
+workload:
+  sample_file_url: "https://example.com/noetl-widget-sample.txt"
+  sample_image_alt: "NoETL widget coverage pixel"
+
+workflow:
+  - step: emit_all_widgets
+    desc: Emit one terminal-prompt render tree covering every GUI widget kind.
+    tool:
+      kind: python
+      input:
+        sample_file_url: "{{ sample_file_url }}"
+        sample_image_alt: "{{ sample_image_alt }}"
+      code: |
+        transparent_png = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+            "/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+        )
+        render = {
+            "type": "app:column",
+            "args": {
+                "gap": 16,
+                "align": "stretch",
+                "children": [
+                    {
+                        "type": "app:title",
+                        "args": {
+                            "text": "Widget all-types coverage",
+                            "size": 22,
+                            "boldness": "bold",
+                        },
+                    },
+                    {
+                        "type": "app:markdown",
+                        "args": {
+                            "text": (
+                                "## Markdown widget\\n"
+                                "- terminal prompt output\\n"
+                                "- **bold** and `code`\\n"
+                                "[NoETL](https://noetl.io)"
+                            ),
+                        },
+                    },
+                    {
+                        "type": "app:text",
+                        "args": {
+                            "title": "Text widget",
+                            "message": "Labeled text message rendered inside NoetlPrompt.",
+                            "titleColor": "#166534",
+                        },
+                    },
+                    {"type": "app:horizontalline", "args": {}},
+                    {
+                        "type": "app:alert",
+                        "args": {
+                            "message": "Alert widget: success path rendered",
+                            "variant": "success",
+                        },
+                    },
+                    {
+                        "type": "app:row",
+                        "args": {
+                            "gap": 12,
+                            "align": "center",
+                            "children": [
+                                {
+                                    "type": "app:statusbar",
+                                    "args": {"text": "Processing", "styleKey": "processing"},
+                                },
+                                {
+                                    "type": "app:icon",
+                                    "args": {
+                                        "name": "CheckCircleOutlined",
+                                        "tooltip": "Icon widget",
+                                        "style": {"color": "#16a34a", "fontSize": 22},
+                                    },
+                                },
+                                {
+                                    "type": "app:tooltip",
+                                    "args": {
+                                        "title": "Tooltip widget rendered",
+                                        "iconName": "InfoCircleOutlined",
+                                        "placement": "right",
+                                    },
+                                },
+                                {
+                                    "type": "app:profilepicture",
+                                    "args": {
+                                        "alt": "Profile picture fallback widget",
+                                        "size": 40,
+                                        "rounded": True,
+                                        "border": True,
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:picture",
+                        "args": {
+                            "imageBase64": transparent_png,
+                            "imageType": "png",
+                            "maxWidth": 24,
+                            "maxHeight": 24,
+                            "altText": sample_image_alt,
+                        },
+                    },
+                    {
+                        "type": "app:infotable",
+                        "args": {
+                            "data": {
+                                "widgetCount": 34,
+                                "terminalPrompt": True,
+                                "source": "e2e fixture",
+                            }
+                        },
+                    },
+                    {
+                        "type": "app:infogrid",
+                        "args": {
+                            "border": True,
+                            "widgets": [
+                                {
+                                    "type": "app:markdown",
+                                    "args": {"text": "### Info grid A\\nNested markdown"},
+                                },
+                                {
+                                    "type": "app:statusbar",
+                                    "args": {"text": "Ready", "styleKey": "success"},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:grouped_table",
+                        "args": {
+                            "groups": [
+                                {
+                                    "title": "Grouped table widget",
+                                    "data": [["alpha", "one"], ["beta", "two"]],
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "type": "app:table",
+                        "args": {
+                            "size": "small",
+                            "data": [["Table widget", "simple"], ["Rows", "2"]],
+                        },
+                    },
+                    {
+                        "type": "app:recordtable",
+                        "args": {
+                            "width": "full",
+                            "pageSize": 5,
+                            "columns": [
+                                {"title": "Name", "dataIndex": "name", "sorter": True},
+                                {"title": "Kind", "dataIndex": "kind"},
+                            ],
+                            "data": [
+                                {"id": "record-1", "name": "Record table widget", "kind": "display"},
+                                {"id": "record-2", "name": "Sortable row", "kind": "display"},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:filedisplay",
+                        "args": {
+                            "file": {
+                                "name": "widget-coverage.txt",
+                                "metadata": {"type": "text/plain"},
+                                "url": sample_file_url,
+                            }
+                        },
+                    },
+                    {
+                        "type": "app:container",
+                        "args": {
+                            "padding": 8,
+                            "margin": {"top": 4, "bottom": 4},
+                            "child": {
+                                "type": "app:text",
+                                "args": {
+                                    "title": "Container widget",
+                                    "message": "This text is nested inside app:container.",
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "type": "app:carousel",
+                        "args": {
+                            "carouselWidth": 360,
+                            "carouselHeight": 120,
+                            "widgets": [
+                                {
+                                    "type": "app:alert",
+                                    "args": {"message": "Carousel slide one", "variant": "info"},
+                                },
+                                {
+                                    "type": "app:markdown",
+                                    "args": {"text": "**Carousel slide two**"},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:expandable",
+                        "args": {
+                            "isExpand": False,
+                            "minimalContent": {
+                                "type": "app:text",
+                                "args": {
+                                    "title": "Expandable widget",
+                                    "message": "Collapsed summary",
+                                },
+                            },
+                            "fullContent": {
+                                "type": "app:markdown",
+                                "args": {"text": "Expanded full widget content"},
+                            },
+                        },
+                    },
+                    {
+                        "type": "app:info_block",
+                        "args": {
+                            "items": [
+                                {
+                                    "title": "Info block widget",
+                                    "description": "Expandable information item",
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "type": "app:row",
+                        "args": {
+                            "gap": 12,
+                            "children": [
+                                {
+                                    "type": "app:button",
+                                    "args": {
+                                        "text": "Button command",
+                                        "buttonType": "primary",
+                                        "event": {
+                                            "key": "command",
+                                            "value": "echo widget-button-command",
+                                        },
+                                    },
+                                },
+                                {
+                                    "type": "app:link",
+                                    "args": {
+                                        "href": "https://noetl.io",
+                                        "label": "Link widget",
+                                        "description": "NoETL docs link",
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:calendar",
+                        "args": {
+                            "width": 280,
+                            "initialDate": "2026-05-08",
+                            "firstDate": "2026-05-01",
+                            "lastDate": "2026-05-31",
+                            "event": {"key": "calendarDate", "valueFormat": "YYYY-MM-DD"},
+                        },
+                    },
+                    {
+                        "type": "app:dropdown",
+                        "args": {
+                            "placeholder": "Dropdown widget",
+                            "selectedId": "b",
+                            "selectionVariants": [
+                                {"id": "a", "label": "Choice A"},
+                                {"id": "b", "label": "Choice B"},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:radio",
+                        "args": {
+                            "title": "Radio widget",
+                            "selectedId": "yes",
+                            "radioValues": [
+                                {"id": "yes", "label": "Yes"},
+                                {"id": "no", "label": "No"},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:checkbox",
+                        "args": {
+                            "title": "Checkbox widget",
+                            "checkboxValues": [
+                                {"id": "red", "label": "Red", "defaultChecked": True},
+                                {"id": "blue", "label": "Blue"},
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:input",
+                        "args": {
+                            "title": "Input widget",
+                            "placeholder": "Type here",
+                            "onChange": {"key": "inputValue"},
+                        },
+                    },
+                    {
+                        "type": "app:form",
+                        "args": {
+                            "fields": [
+                                {
+                                    "id": "email",
+                                    "title": "Form email",
+                                    "validation": "email",
+                                    "default_value": "person@example.com",
+                                }
+                            ],
+                            "buttons": [
+                                {
+                                    "text": "Submit form",
+                                    "colorType": "primary",
+                                    "event": {"key": "formSubmit"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:customform",
+                        "args": {
+                            "revision": "all-types-v1",
+                            "buttonPlacement": "bottom",
+                            "fields": [
+                                [
+                                    {
+                                        "id": "first",
+                                        "title": "Custom first",
+                                        "default_value": "Ada",
+                                    },
+                                    {
+                                        "id": "last",
+                                        "title": "Custom last",
+                                        "default_value": "Lovelace",
+                                    },
+                                ]
+                            ],
+                            "buttons": [
+                                {
+                                    "text": "Submit custom form",
+                                    "colorType": "primary",
+                                    "event": {"key": "customFormSubmit"},
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:quiz",
+                        "args": {
+                            "questionWidth": 360,
+                            "finishText": "Finish quiz",
+                            "questions": [
+                                {
+                                    "questionId": "q1",
+                                    "questionText": "Quiz widget question",
+                                    "answers": [
+                                        {"answerId": "a", "label": "Answer A"},
+                                        {"answerId": "b", "label": "Answer B"},
+                                    ],
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "app:draganddrop",
+                        "args": {
+                            "text": "Drag and drop widget",
+                            "width": "320px",
+                            "height": "96px",
+                        },
+                    },
+                    {
+                        "type": "app:code",
+                        "args": {
+                            "lang": "python",
+                            "caption": "Code widget",
+                            "source": "print('widget coverage')",
+                        },
+                    },
+                    {
+                        "type": "app:iframe",
+                        "args": {
+                            "url": "about:blank",
+                            "height": 80,
+                            "title": "Iframe widget",
+                        },
+                    },
+                ],
+            },
+        }
+
+        result = {
+            "status": "ok",
+            "widget_types": [
+                "app:alert",
+                "app:button",
+                "app:calendar",
+                "app:carousel",
+                "app:checkbox",
+                "app:code",
+                "app:column",
+                "app:container",
+                "app:customform",
+                "app:draganddrop",
+                "app:dropdown",
+                "app:expandable",
+                "app:filedisplay",
+                "app:form",
+                "app:grouped_table",
+                "app:horizontalline",
+                "app:icon",
+                "app:iframe",
+                "app:infogrid",
+                "app:infotable",
+                "app:info_block",
+                "app:input",
+                "app:link",
+                "app:markdown",
+                "app:picture",
+                "app:profilepicture",
+                "app:quiz",
+                "app:radio",
+                "app:recordtable",
+                "app:row",
+                "app:statusbar",
+                "app:table",
+                "app:text",
+                "app:title",
+                "app:tooltip",
+            ],
+            "widget_count": 35,
+            "render": render,
+        }
