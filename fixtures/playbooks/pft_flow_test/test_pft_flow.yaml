@@ -2383,6 +2383,112 @@ workflow:
           END IF;
         END $$;
 
+        WITH facilities AS (
+          SELECT facility_mapping_id
+          FROM public.pft_test_facilities
+        ),
+        assessments AS (
+          SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+          FROM public.pft_test_patient_assessments
+          GROUP BY facility_mapping_id
+        ),
+        conditions AS (
+          SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+          FROM public.pft_test_patient_conditions
+          GROUP BY facility_mapping_id
+        ),
+        medications AS (
+          SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+          FROM public.pft_test_patient_medications
+          GROUP BY facility_mapping_id
+        ),
+        vital_signs AS (
+          SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+          FROM public.pft_test_patient_vital_signs
+          GROUP BY facility_mapping_id
+        ),
+        demographics AS (
+          SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+          FROM public.pft_test_patient_demographics
+          GROUP BY facility_mapping_id
+        ),
+        queue_assessments AS (
+          SELECT facility_mapping_id, COUNT(DISTINCT patient_id) AS n
+          FROM public.pft_test_patient_work_queue
+          WHERE execution_id = '{{ execution_id }}'
+            AND data_type = 'assessments'
+            AND status = 'done'
+          GROUP BY facility_mapping_id
+        ),
+        mds_expected AS (
+          SELECT facility_mapping_id, COUNT(*) AS n
+          FROM public.pft_test_mds_assessment_ids_work
+          GROUP BY facility_mapping_id
+        ),
+        mds_done AS (
+          SELECT facility_mapping_id, COUNT(*) AS n
+          FROM public.pft_test_mds_assessment_details
+          GROUP BY facility_mapping_id
+        ),
+        validation AS (
+          SELECT
+            f.facility_mapping_id,
+            COALESCE(a.n, 0) AS assessments_done,
+            COALESCE(c.n, 0) AS conditions_done,
+            COALESCE(m.n, 0) AS medications_done,
+            COALESCE(v.n, 0) AS vital_signs_done,
+            COALESCE(d.n, 0) AS demographics_done,
+            COALESCE(qa.n, 0) AS assessments_queue_done,
+            COALESCE(me.n, 0) AS mds_expected,
+            COALESCE(md.n, 0) AS mds_details_done
+          FROM facilities f
+          LEFT JOIN assessments a ON a.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN conditions c ON c.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN medications m ON m.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN vital_signs v ON v.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN demographics d ON d.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN queue_assessments qa ON qa.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN mds_expected me ON me.facility_mapping_id = f.facility_mapping_id
+          LEFT JOIN mds_done md ON md.facility_mapping_id = f.facility_mapping_id
+        )
+        INSERT INTO public.pft_test_validation_log (
+          execution_id,
+          facility_mapping_id,
+          assessments_done,
+          conditions_done,
+          medications_done,
+          vital_signs_done,
+          demographics_done,
+          assessments_queue_done,
+          mds_expected,
+          mds_details_done,
+          total_expected
+        )
+        SELECT
+          '{{ execution_id }}',
+          facility_mapping_id,
+          assessments_done,
+          conditions_done,
+          medications_done,
+          vital_signs_done,
+          demographics_done,
+          assessments_queue_done,
+          mds_expected,
+          mds_details_done,
+          {{ workload.patients_per_facility | int }}
+        FROM validation
+        ON CONFLICT (execution_id, facility_mapping_id) DO UPDATE SET
+          assessments_done = EXCLUDED.assessments_done,
+          conditions_done = EXCLUDED.conditions_done,
+          medications_done = EXCLUDED.medications_done,
+          vital_signs_done = EXCLUDED.vital_signs_done,
+          demographics_done = EXCLUDED.demographics_done,
+          assessments_queue_done = EXCLUDED.assessments_queue_done,
+          mds_expected = EXCLUDED.mds_expected,
+          mds_details_done = EXCLUDED.mds_details_done,
+          total_expected = EXCLUDED.total_expected,
+          logged_at = NOW();
+
         SELECT
           'passed' AS status,
           {{ workload.num_facilities | int }} AS facilities_checked,
