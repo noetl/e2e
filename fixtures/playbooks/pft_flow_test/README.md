@@ -37,7 +37,7 @@ lost patients or skipped detail rows.
 | Facilities | 10 |
 | Patients per facility | 1,000 |
 | Total patients | 10,000 |
-| Batch size | 100 patients (`pft_batch_size`) |
+| Batch size | 25 patients (`pft_batch_size`) |
 | Batch concurrency | 16 action slots (`pft_batch_concurrency`) |
 | Batches per data type | 100 for 10k patients |
 | Page size | 10 records/page |

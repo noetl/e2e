@@ -27,7 +27,7 @@ workload:
   page_size: 10
   num_facilities: 10
   patients_per_facility: 1000
-  pft_batch_size: 100
+  pft_batch_size: 25
   pft_batch_concurrency: 16
   batch_slots: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
@@ -2276,9 +2276,6 @@ workflow:
         mode: exclusive
       arcs:
         - step: check_results
-    set:
-      ctx.final_validation_rows: '{{ output.data.rows | default([]) }}'
-
   - step: check_results
     desc: |
       Assert all 10 facilities have 1000/1000 patients with ACTUAL data in result tables.
@@ -2293,22 +2290,73 @@ workflow:
           failure_count INTEGER;
           facility_count INTEGER;
         BEGIN
-          WITH validation AS (
-            SELECT *
-            FROM JSONB_TO_RECORDSET('{{ ctx.final_validation_rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(
-                facility_mapping_id INTEGER,
-                assessments_done INTEGER,
-                conditions_done INTEGER,
-                medications_done INTEGER,
-                vital_signs_done INTEGER,
-                demographics_done INTEGER,
-                assessments_queue_done INTEGER,
-                mds_expected INTEGER,
-                mds_details_done INTEGER,
-                total_expected INTEGER,
-                all_passed BOOLEAN
-              )
+          WITH facilities AS (
+            SELECT facility_mapping_id
+            FROM public.pft_test_facilities
+          ),
+          assessments AS (
+            SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+            FROM public.pft_test_patient_assessments
+            GROUP BY facility_mapping_id
+          ),
+          conditions AS (
+            SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+            FROM public.pft_test_patient_conditions
+            GROUP BY facility_mapping_id
+          ),
+          medications AS (
+            SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+            FROM public.pft_test_patient_medications
+            GROUP BY facility_mapping_id
+          ),
+          vital_signs AS (
+            SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+            FROM public.pft_test_patient_vital_signs
+            GROUP BY facility_mapping_id
+          ),
+          demographics AS (
+            SELECT facility_mapping_id, COUNT(DISTINCT pcc_patient_id) AS n
+            FROM public.pft_test_patient_demographics
+            GROUP BY facility_mapping_id
+          ),
+          queue_assessments AS (
+            SELECT facility_mapping_id, COUNT(DISTINCT patient_id) AS n
+            FROM public.pft_test_patient_work_queue
+            WHERE execution_id = '{{ execution_id }}'
+              AND data_type = 'assessments'
+              AND status = 'done'
+            GROUP BY facility_mapping_id
+          ),
+          mds_expected AS (
+            SELECT facility_mapping_id, COUNT(*) AS n
+            FROM public.pft_test_mds_assessment_ids_work
+            GROUP BY facility_mapping_id
+          ),
+          mds_done AS (
+            SELECT facility_mapping_id, COUNT(*) AS n
+            FROM public.pft_test_mds_assessment_details
+            GROUP BY facility_mapping_id
+          ),
+          validation AS (
+            SELECT
+              f.facility_mapping_id,
+              COALESCE(a.n, 0) AS assessments_done,
+              COALESCE(c.n, 0) AS conditions_done,
+              COALESCE(m.n, 0) AS medications_done,
+              COALESCE(v.n, 0) AS vital_signs_done,
+              COALESCE(d.n, 0) AS demographics_done,
+              COALESCE(qa.n, 0) AS assessments_queue_done,
+              COALESCE(me.n, 0) AS mds_expected,
+              COALESCE(md.n, 0) AS mds_details_done
+            FROM facilities f
+            LEFT JOIN assessments a ON a.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN conditions c ON c.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN medications m ON m.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN vital_signs v ON v.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN demographics d ON d.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN queue_assessments qa ON qa.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN mds_expected me ON me.facility_mapping_id = f.facility_mapping_id
+            LEFT JOIN mds_done md ON md.facility_mapping_id = f.facility_mapping_id
           )
           SELECT
             COUNT(*),
