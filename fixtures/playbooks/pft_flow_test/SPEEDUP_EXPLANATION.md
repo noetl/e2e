@@ -437,3 +437,53 @@ because Podman, local disk, local CPU allocation, and local PostgreSQL/worker
 resources are smaller than the GKE setup. But the current playbook should no
 longer have the old 30-minute structural bottleneck because the inner loop is
 batch-oriented and action-controlled.
+
+## Local Kind Re-Test After Documentation Commit
+
+After this explanation was first committed, the same current playbook was
+deployed and tested on the local `kind-noetl` cluster.
+
+Local deploy state:
+
+- Podman machine: `noetl-dev`
+- kind cluster: `kind-noetl`
+- NoETL server image: `ghcr.io/noetl/noetl:v2.37.1`
+- NoETL worker image: `ghcr.io/noetl/noetl:v2.37.1`
+- Fixture server image loaded into kind: `localhost/local/test-server:e2e-6970342`
+- Fixture server endpoint checked locally:
+  `http://127.0.0.1:32555/api/v1/pft/batch/demographics`
+
+Local catalog/execution:
+
+- Catalog path: `fixtures/playbooks/pft_flow_test/test_pft_flow`
+- Local catalog version: `1`
+- Execution: `622010462971888356`
+- Status: `COMPLETED`
+- Started: `2026-05-08T05:03:45.456852Z`
+- Finished: `2026-05-08T05:04:39.915434Z`
+- Duration: `54.459s` (`54s`)
+- Final `check_results`: `passed`
+
+Local table verification was run through a NoETL `postgres` action probe:
+
+- Probe execution: `622011140586864733`
+- Facilities: `10`
+- Assessments: `10000`
+- Conditions: `10000`
+- Medications: `10000`
+- Vital signs: `10000`
+- Demographics: `10000`
+- MDS expected: `10000`
+- MDS details done: `10000`
+- Queue done counts for all five data types: `10000`
+- `pft_test_validation_log` rows: `10`
+- Per-facility validation-log min/max counts: `1000/1000`
+- `actual_tables_pass`: `true`
+- `queue_tables_pass`: `true`
+- `validation_log_pass`: `true`
+
+This local result removes the earlier caveat for the current environment. The
+same local setup that previously exposed 30-minute behavior now completes the
+10,000-patient action-controlled playbook in under one minute. The improvement
+therefore comes from the playbook execution shape, not merely from GKE being
+faster than local kind.
