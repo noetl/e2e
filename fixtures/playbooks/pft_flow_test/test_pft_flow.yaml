@@ -440,7 +440,7 @@ workflow:
       iterator: slot
       spec:
         mode: parallel
-        max_in_flight: '{{ workload.pft_batch_concurrency | int }}'
+        max_in_flight: 16
     tool:
       - name: claim_batch
         kind: postgres
