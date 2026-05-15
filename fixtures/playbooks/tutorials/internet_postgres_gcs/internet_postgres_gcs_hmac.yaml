@@ -1,0 +1,174 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: internet_postgres_gcs_hmac
+  path: fixtures/playbooks/tutorials/internet_postgres_gcs/hmac
+  description: Download public JSON, store it in Postgres, then export Postgres rows to GCS using HMAC credentials.
+
+workload:
+  api_url: https://api.github.com/repos/noetl/noetl
+  pg_auth: pg_tutorial
+  gcs_credential: gcs_hmac_tutorial
+  gcs_bucket: noetl-tutorial-bucket
+  gcs_prefix: noetl/tutorial/internet-postgres-gcs
+  export_file: github_repo_{{ execution_id }}.csv
+
+workflow:
+  - step: start
+    desc: Initialize tutorial execution
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "initialized"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: create_table
+
+  - step: create_table
+    desc: Create the Postgres table used by the tutorial
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        CREATE TABLE IF NOT EXISTS public.noetl_tutorial_downloads (
+          id BIGSERIAL PRIMARY KEY,
+          execution_id TEXT NOT NULL,
+          source_url TEXT NOT NULL,
+          payload JSONB NOT NULL,
+          downloaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: fetch_payload
+
+  - step: fetch_payload
+    desc: Download JSON from the public internet
+    tool:
+      kind: python
+      libs:
+        request:
+          from: urllib
+          import: request
+        json: json
+      input:
+        api_url: "{{ api_url }}"
+      code: |
+        req = request.Request(
+            api_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "noetl-tutorial",
+            },
+        )
+        with request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        record = {
+            "id": payload.get("id"),
+            "full_name": payload.get("full_name"),
+            "html_url": payload.get("html_url"),
+            "description": payload.get("description"),
+            "language": payload.get("language"),
+            "stargazers_count": payload.get("stargazers_count"),
+            "forks_count": payload.get("forks_count"),
+            "updated_at": payload.get("updated_at"),
+        }
+        result = {
+            **record,
+            "payload_json_sql": json.dumps(record, separators=(",", ":")).replace("'", "''"),
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: insert_payload
+
+  - step: insert_payload
+    desc: Insert one downloaded JSON row into Postgres
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        INSERT INTO public.noetl_tutorial_downloads (
+          execution_id,
+          source_url,
+          payload
+        ) VALUES (
+          '{{ execution_id }}',
+          '{{ api_url }}',
+          '{{ fetch_payload.payload_json_sql }}'::jsonb
+        );
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: verify_postgres
+
+  - step: verify_postgres
+    desc: Confirm this execution has data in Postgres
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        SELECT
+          COUNT(*) AS rows_for_execution,
+          MAX(payload->>'full_name') AS repo_name
+        FROM public.noetl_tutorial_downloads
+        WHERE execution_id = '{{ execution_id }}';
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: export_postgres_to_gcs
+
+  - step: export_postgres_to_gcs
+    desc: Read rows from Postgres through DuckDB and write a CSV object to GCS
+    tool:
+      kind: duckdb
+      gcs_credential: "{{ gcs_credential }}"
+      auth:
+        pg_db:
+          source: credential
+          tool: postgres
+          key: "{{ pg_auth }}"
+        gcs_secret:
+          source: credential
+          tool: hmac
+          key: "{{ gcs_credential }}"
+          scope: gs://{{ gcs_bucket }}
+      commands: |
+        INSTALL postgres; LOAD postgres;
+        INSTALL httpfs; LOAD httpfs;
+        ATTACH '' AS pg_db (TYPE postgres, SECRET pg_db);
+
+        COPY (
+          SELECT
+            execution_id,
+            source_url,
+            payload->>'full_name' AS repo_name,
+            payload->>'html_url' AS repo_url,
+            downloaded_at
+          FROM pg_db.public.noetl_tutorial_downloads
+          WHERE execution_id = '{{ execution_id }}'
+          ORDER BY id
+        ) TO 'gs://{{ gcs_bucket }}/{{ gcs_prefix }}/{{ export_file }}'
+        (FORMAT CSV, HEADER TRUE);
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Finish tutorial execution
+    tool:
+      kind: python
+      input:
+        gcs_uri: "gs://{{ gcs_bucket }}/{{ gcs_prefix }}/{{ export_file }}"
+      code: |
+        result = {"status": "completed", "gcs_uri": gcs_uri}
