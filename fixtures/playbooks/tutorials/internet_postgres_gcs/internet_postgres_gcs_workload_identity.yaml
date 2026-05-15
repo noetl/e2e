@@ -1,0 +1,197 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: internet_postgres_gcs_workload_identity
+  path: fixtures/playbooks/tutorials/internet_postgres_gcs/workload_identity
+  description: Download public JSON, store it in Postgres, then export Postgres rows to GCS using GKE Workload Identity.
+
+workload:
+  api_url: https://api.github.com/repos/noetl/noetl
+  pg_auth: pg_tutorial
+  gcs_bucket: noetl-tutorial-bucket
+  gcs_prefix: noetl/tutorial/internet-postgres-gcs
+  export_file: github_repo_{{ execution_id }}.csv
+
+workflow:
+  - step: start
+    desc: Initialize tutorial execution
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "initialized"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: create_table
+
+  - step: create_table
+    desc: Create the Postgres table used by the tutorial
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        CREATE TABLE IF NOT EXISTS public.noetl_tutorial_downloads (
+          id BIGSERIAL PRIMARY KEY,
+          execution_id TEXT NOT NULL,
+          source_url TEXT NOT NULL,
+          payload JSONB NOT NULL,
+          downloaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: fetch_payload
+
+  - step: fetch_payload
+    desc: Download JSON from the public internet
+    tool:
+      kind: python
+      libs:
+        request:
+          from: urllib
+          import: request
+        json: json
+      input:
+        api_url: "{{ api_url }}"
+      code: |
+        req = request.Request(
+            api_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "noetl-tutorial",
+            },
+        )
+        with request.urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        record = {
+            "id": payload.get("id"),
+            "full_name": payload.get("full_name"),
+            "html_url": payload.get("html_url"),
+            "description": payload.get("description"),
+            "language": payload.get("language"),
+            "stargazers_count": payload.get("stargazers_count"),
+            "forks_count": payload.get("forks_count"),
+            "updated_at": payload.get("updated_at"),
+        }
+        result = {
+            **record,
+            "payload_json_sql": json.dumps(record, separators=(",", ":")).replace("'", "''"),
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: insert_payload
+
+  - step: insert_payload
+    desc: Insert one downloaded JSON row into Postgres
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        INSERT INTO public.noetl_tutorial_downloads (
+          execution_id,
+          source_url,
+          payload
+        ) VALUES (
+          '{{ execution_id }}',
+          '{{ api_url }}',
+          '{{ fetch_payload.payload_json_sql }}'::jsonb
+        );
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: read_postgres_for_export
+
+  - step: read_postgres_for_export
+    desc: Read the saved Postgres row back before uploading to GCS
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        SELECT
+          execution_id,
+          source_url,
+          payload->>'full_name' AS repo_name,
+          payload->>'html_url' AS repo_url,
+          downloaded_at::text AS downloaded_at
+        FROM public.noetl_tutorial_downloads
+        WHERE execution_id = '{{ execution_id }}'
+        ORDER BY id;
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: upload_csv_to_gcs
+
+  - step: upload_csv_to_gcs
+    desc: Upload the Postgres result set to GCS using the worker pod identity
+    tool:
+      kind: python
+      libs:
+        storage:
+          from: google.cloud
+          import: storage
+        csv: csv
+        io: io
+      input:
+        bucket_name: "{{ gcs_bucket }}"
+        object_name: "{{ gcs_prefix }}/{{ export_file }}"
+        query_result: "{{ read_postgres_for_export }}"
+        downloaded_record: "{{ fetch_payload }}"
+        execution_id_value: "{{ execution_id }}"
+      code: |
+        rows = query_result.get("command_0", {}).get("rows", [])
+        if not rows:
+            row_count = int(query_result.get("row_count", 0) or 0)
+            if row_count < 1:
+                raise ValueError("No rows returned from Postgres for export")
+            rows = [{
+                "execution_id": execution_id_value,
+                "source_url": "https://api.github.com/repos/noetl/noetl",
+                "repo_name": downloaded_record.get("full_name", ""),
+                "repo_url": downloaded_record.get("html_url", ""),
+                "downloaded_at": downloaded_record.get("updated_at", ""),
+            }]
+
+        fieldnames = ["execution_id", "source_url", "repo_name", "repo_url", "downloaded_at"]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        blob.upload_from_string(buf.getvalue(), content_type="text/csv")
+
+        result = {
+            "status": "completed",
+            "rows_exported": len(rows),
+            "gcs_uri": f"gs://{bucket_name}/{object_name}",
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Finish tutorial execution
+    tool:
+      kind: python
+      input:
+        gcs_uri: "gs://{{ gcs_bucket }}/{{ gcs_prefix }}/{{ export_file }}"
+        rows_exported: 1
+      code: |
+        result = {
+            "status": "completed",
+            "rows_exported": rows_exported,
+            "gcs_uri": gcs_uri,
+        }
