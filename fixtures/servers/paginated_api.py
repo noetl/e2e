@@ -17,6 +17,7 @@ import random
 import string
 from collections import defaultdict, deque
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +38,14 @@ PATIENT_RECORDS_MIN_PAGES = int(os.getenv("PATIENT_RECORDS_MIN_PAGES", "2"))
 PATIENT_RECORDS_MAX_PAGES = int(os.getenv("PATIENT_RECORDS_MAX_PAGES", "5"))
 PATIENT_RECORDS_PAYLOAD_KB = int(os.getenv("PATIENT_RECORDS_PAYLOAD_KB", "100"))
 CONCURRENCY_PROBE_MAX_EVENTS = int(os.getenv("CONCURRENCY_PROBE_MAX_EVENTS", "200"))
+PFT_RATE_LIMIT = 50
 
 # Track request attempts per page for flaky endpoint
 flaky_attempts = defaultdict(int)
 rate_limit_tracker = defaultdict(list)  # Track requests per second
 patient_records_rate_tracker: list = []  # Global rate tracker for /patient-records
+pft_rate_tracker: deque[float] = deque()  # Global rate tracker for PFT fixture endpoints
+pft_rate_lock = threading.Lock()
 
 # Track async overlap behavior for concurrency probes
 concurrency_probe_lock = asyncio.Lock()
@@ -888,7 +892,7 @@ def _pft_page_count(patient_id: str, data_type: str, min_p: int, max_p: int) -> 
 def _pft_records(patient_id: str, data_type: str, page: int, page_size: int) -> list:
     """Generate synthetic records for a given patient, data type, and page."""
     seed = int(hashlib.md5(f"{patient_id}:{data_type}:{page}".encode()).hexdigest(), 16)
-    return [
+    records = [
         {
             "id": f"{data_type[:4].upper()}-{patient_id}-p{page}-i{i}",
             "patientId": str(patient_id),
@@ -897,78 +901,104 @@ def _pft_records(patient_id: str, data_type: str, page: int, page_size: int) -> 
         }
         for i in range(page_size)
     ]
+    if data_type == "assessments":
+        for index, record in enumerate(records):
+            mds_count = 5 + ((seed + index) % 6)
+            record["mdsAssessmentIds"] = [
+                f"MDS-{patient_id}-p{page}-{index}-{i:02d}"
+                for i in range(1, mds_count + 1)
+            ]
+            record["mdsCount"] = mds_count
+    return records
+
+
+def _enforce_pft_rate_limit() -> None:
+    """Enforce the fixture API's 50 requests/second contract for PFT endpoints."""
+    now = time.time()
+    with pft_rate_lock:
+        while pft_rate_tracker and now - pft_rate_tracker[0] >= 1.0:
+            pft_rate_tracker.popleft()
+        if len(pft_rate_tracker) >= PFT_RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Too Many Requests",
+                headers={"Retry-After": "1"},
+            )
+        pft_rate_tracker.append(now)
+
+
+def _pft_single_page_payload(patient_id: str, data_type: str, page: int, total_pages: int) -> dict:
+    """Return exactly one synthetic record for exactly one page."""
+    return {
+        "data": _pft_records(patient_id, data_type, page, 1),
+        "paging": {
+            "hasMore": page < total_pages,
+            "page": page,
+            "pageSize": 1,
+            "total": total_pages,
+        },
+    }
 
 
 @app.get('/api/v1/patient/assessments')
 def get_pft_patient_assessments(
     patientId: str = Query(...),
-    page: int = Query(default=1),
+    page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10),
 ):
-    """Per-patient assessments: 2–4 pages, {data, paging} response."""
+    """Per-patient assessments: 2–4 one-record pages, {data, paging} response."""
+    _enforce_pft_rate_limit()
     total_pages = _pft_page_count(patientId, 'assessments', 2, 4)
     if page > total_pages:
         return JSONResponse(status_code=404, content={"error": "page not found"})
-    items = _pft_records(patientId, 'assessments', page, pageSize)
-    return {
-        "data": items,
-        "paging": {"hasMore": page < total_pages, "page": page, "pageSize": pageSize, "total": total_pages * pageSize},
-    }
+    return _pft_single_page_payload(patientId, 'assessments', page, total_pages)
 
 
 @app.get('/api/v1/patient/conditions')
 def get_pft_patient_conditions(
     patientId: str = Query(...),
-    page: int = Query(default=1),
+    page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10),
 ):
-    """Per-patient conditions: 1–3 pages, {data, paging} response."""
+    """Per-patient conditions: 1–3 one-record pages, {data, paging} response."""
+    _enforce_pft_rate_limit()
     total_pages = _pft_page_count(patientId, 'conditions', 1, 3)
     if page > total_pages:
         return JSONResponse(status_code=404, content={"error": "page not found"})
-    items = _pft_records(patientId, 'conditions', page, pageSize)
-    return {
-        "data": items,
-        "paging": {"hasMore": page < total_pages, "page": page, "pageSize": pageSize, "total": total_pages * pageSize},
-    }
+    return _pft_single_page_payload(patientId, 'conditions', page, total_pages)
 
 
 @app.get('/api/v1/patient/medications')
 def get_pft_patient_medications(
     patientId: str = Query(...),
-    page: int = Query(default=1),
+    page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10),
 ):
-    """Per-patient medications: 2–3 pages, {data, paging} response."""
+    """Per-patient medications: 2–3 one-record pages, {data, paging} response."""
+    _enforce_pft_rate_limit()
     total_pages = _pft_page_count(patientId, 'medications', 2, 3)
     if page > total_pages:
         return JSONResponse(status_code=404, content={"error": "page not found"})
-    items = _pft_records(patientId, 'medications', page, pageSize)
-    return {
-        "data": items,
-        "paging": {"hasMore": page < total_pages, "page": page, "pageSize": pageSize, "total": total_pages * pageSize},
-    }
+    return _pft_single_page_payload(patientId, 'medications', page, total_pages)
 
 
 @app.get('/api/v1/patient/vital_signs')
 def get_pft_patient_vital_signs(
     patientId: str = Query(...),
-    page: int = Query(default=1),
+    page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10),
 ):
-    """Per-patient vital signs: always exactly 1 page (hasMore always false)."""
+    """Per-patient vital signs: always exactly one one-record page."""
+    _enforce_pft_rate_limit()
     if page > 1:
         return JSONResponse(status_code=404, content={"error": "page not found"})
-    items = _pft_records(patientId, 'vital_signs', 1, pageSize)
-    return {
-        "data": items,
-        "paging": {"hasMore": False, "page": 1, "pageSize": pageSize, "total": pageSize},
-    }
+    return _pft_single_page_payload(patientId, 'vital_signs', 1, 1)
 
 
 @app.get('/api/v1/patient/demographics')
 def get_pft_patient_demographics(patientId: str = Query(...)):
     """Per-patient demographics: non-paginated, returns single record."""
+    _enforce_pft_rate_limit()
     seed = int(hashlib.md5(f"{patientId}:demographics".encode()).hexdigest(), 16)
     return {
         "patientId": patientId,
@@ -983,6 +1013,7 @@ def get_pft_patient_demographics(patientId: str = Query(...)):
 @app.get('/api/v1/mds/assessment_ids')
 def get_mds_assessment_ids(patientId: str = Query(...)):
     """Return 2–5 synthetic MDS assessment IDs for a patient."""
+    _enforce_pft_rate_limit()
     seed = int(hashlib.md5(f"{patientId}:mds".encode()).hexdigest(), 16)
     count = 2 + (seed % 4)
     return {
@@ -995,6 +1026,11 @@ def get_mds_assessment_ids(patientId: str = Query(...)):
 @app.get('/api/v1/mds/assessment/{assessment_id}')
 def get_mds_assessment_detail(assessment_id: str):
     """Return synthetic MDS assessment detail."""
+    _enforce_pft_rate_limit()
+    return _pft_mds_assessment_detail(assessment_id)
+
+
+def _pft_mds_assessment_detail(assessment_id: str) -> dict:
     seed = int(hashlib.md5(assessment_id.encode()).hexdigest(), 16)
     return {
         "assessmentId": assessment_id,
@@ -1028,25 +1064,29 @@ def _pft_batch_patient_ids(patientIds: str) -> list[int]:
         ids.append(int(text))
     if not ids:
         raise HTTPException(status_code=400, detail="patientIds must contain at least one patient id")
-    if len(ids) > 500:
-        raise HTTPException(status_code=400, detail="patientIds batch size must be <= 500")
+    if len(ids) != 1:
+        raise HTTPException(status_code=400, detail="patientIds must contain exactly one patient id")
     return ids
 
 
 @app.get('/api/v1/pft/batch/{data_type}')
 def get_pft_batch(
     data_type: str,
-    patientIds: str = Query(..., description="Comma-separated patient IDs"),
+    patientIds: str = Query(..., description="Single patient ID"),
+    page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10, ge=1),
     patientsPerFacility: int = Query(default=1000, ge=1),
 ):
-    """Return normalized PFT rows for a bounded batch of patient IDs.
+    """Return one normalized PFT row for one patient/page.
 
-    This endpoint is intentionally fixture-scoped. It lets NoETL playbooks keep
-    high-throughput orchestration inside declared `http` + `postgres` actions
-    instead of handing broad database credentials to arbitrary Python code.
+    This endpoint is intentionally fixture-scoped. It now mirrors the stricter
+    API contract used by the PFT flow: callers may request one patient and one
+    page per call only, and the fixture enforces a global 50 req/s limit.
     """
+    _enforce_pft_rate_limit()
     patient_ids = _pft_batch_patient_ids(patientIds)
+    patient_id = patient_ids[0]
+    facility_mapping_id = _pft_facility_mapping_id(patient_id, patientsPerFacility)
     rows = []
 
     if data_type in {"assessments", "conditions", "medications", "vital_signs"}:
@@ -1057,62 +1097,55 @@ def get_pft_batch(
             "vital_signs": (1, 1),
         }
         min_pages, max_pages = page_bounds[data_type]
-        for patient_id in patient_ids:
-            total_pages = _pft_page_count(str(patient_id), data_type, min_pages, max_pages)
-            facility_mapping_id = _pft_facility_mapping_id(patient_id, patientsPerFacility)
-            for page in range(1, total_pages + 1):
-                rows.append(
-                    {
-                        "patient_id": patient_id,
-                        "facility_mapping_id": facility_mapping_id,
-                        "page_number": page,
-                        "payload": {
-                            "data": _pft_records(str(patient_id), data_type, page, pageSize),
-                            "paging": {
-                                "hasMore": page < total_pages,
-                                "page": page,
-                                "pageSize": pageSize,
-                                "total": total_pages * pageSize,
-                            },
-                        },
-                        "is_last_page": page == total_pages,
-                    }
-                )
+        total_pages = _pft_page_count(str(patient_id), data_type, min_pages, max_pages)
+        if page > total_pages:
+            raise HTTPException(status_code=404, detail=f"Page {page} does not exist for patient {patient_id}")
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "facility_mapping_id": facility_mapping_id,
+                "page_number": page,
+                "payload": _pft_single_page_payload(str(patient_id), data_type, page, total_pages),
+                "is_last_page": page == total_pages,
+            }
+        )
     elif data_type == "demographics":
-        for patient_id in patient_ids:
-            seed = int(hashlib.md5(f"{patient_id}:demographics".encode()).hexdigest(), 16)
-            rows.append(
-                {
-                    "patient_id": patient_id,
-                    "facility_mapping_id": _pft_facility_mapping_id(patient_id, patientsPerFacility),
-                    "payload": {
-                        "patientId": str(patient_id),
-                        "firstName": f"First{seed % 1000}",
-                        "lastName": f"Last{(seed >> 8) % 1000}",
-                        "dob": f"19{50 + seed % 50}-{1 + seed % 12:02d}-{1 + (seed >> 4) % 28:02d}",
-                        "gender": "M" if seed % 2 == 0 else "F",
-                        "status": "active",
-                    },
-                }
-            )
+        if page != 1:
+            raise HTTPException(status_code=404, detail=f"Page {page} does not exist for patient {patient_id}")
+        seed = int(hashlib.md5(f"{patient_id}:demographics".encode()).hexdigest(), 16)
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "facility_mapping_id": facility_mapping_id,
+                "payload": {
+                    "patientId": str(patient_id),
+                    "firstName": f"First{seed % 1000}",
+                    "lastName": f"Last{(seed >> 8) % 1000}",
+                    "dob": f"19{50 + seed % 50}-{1 + seed % 12:02d}-{1 + (seed >> 4) % 28:02d}",
+                    "gender": "M" if seed % 2 == 0 else "F",
+                    "status": "active",
+                },
+            }
+        )
     elif data_type == "mds":
-        for patient_id in patient_ids:
-            assessment_last_page = _pft_page_count(str(patient_id), "assessments", 2, 4)
-            assessment_id = f"MDS-{patient_id}-{assessment_last_page}"
-            rows.append(
-                {
-                    "patient_id": patient_id,
-                    "facility_mapping_id": _pft_facility_mapping_id(patient_id, patientsPerFacility),
-                    "assessment_id": assessment_id,
-                    "payload": get_mds_assessment_detail(assessment_id),
-                }
-            )
+        if page != 1:
+            raise HTTPException(status_code=404, detail=f"Page {page} does not exist for patient {patient_id}")
+        assessment_last_page = _pft_page_count(str(patient_id), "assessments", 2, 4)
+        assessment_id = f"MDS-{patient_id}-{assessment_last_page}"
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "facility_mapping_id": facility_mapping_id,
+                "assessment_id": assessment_id,
+                "payload": _pft_mds_assessment_detail(assessment_id),
+            }
+        )
     else:
         raise HTTPException(status_code=400, detail=f"unsupported PFT batch data_type: {data_type}")
 
     return {
         "dataType": data_type,
-        "patientCount": len(patient_ids),
+        "patientCount": 1,
         "rowCount": len(rows),
         "rows": rows,
     }
