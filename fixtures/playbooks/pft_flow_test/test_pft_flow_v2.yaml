@@ -404,7 +404,7 @@ workflow:
               AND status = 'pending'
             ORDER BY ((patient_id - 1) % {{ workload.patients_per_facility | int }}), facility_mapping_id
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT {{ __frame_max_rows | default(1) | int }}
           )
           UPDATE public.pft_test_patient_work_queue q
           SET status = 'claimed',
@@ -602,7 +602,7 @@ workflow:
               AND status = 'pending'
             ORDER BY ((patient_id - 1) % {{ workload.patients_per_facility | int }}), facility_mapping_id
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT {{ __frame_max_rows | default(1) | int }}
           )
           UPDATE public.pft_test_patient_work_queue q
           SET status = 'claimed',
@@ -800,7 +800,7 @@ workflow:
               AND status = 'pending'
             ORDER BY ((patient_id - 1) % {{ workload.patients_per_facility | int }}), facility_mapping_id
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT {{ __frame_max_rows | default(1) | int }}
           )
           UPDATE public.pft_test_patient_work_queue q
           SET status = 'claimed',
@@ -998,7 +998,7 @@ workflow:
               AND status = 'pending'
             ORDER BY ((patient_id - 1) % {{ workload.patients_per_facility | int }}), facility_mapping_id
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT {{ __frame_max_rows | default(1) | int }}
           )
           UPDATE public.pft_test_patient_work_queue q
           SET status = 'claimed',
@@ -1196,7 +1196,7 @@ workflow:
               AND status = 'pending'
             ORDER BY ((patient_id - 1) % {{ workload.patients_per_facility | int }}), facility_mapping_id
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT {{ __frame_max_rows | default(1) | int }}
           )
           UPDATE public.pft_test_patient_work_queue q
           SET status = 'claimed',
@@ -1420,7 +1420,7 @@ workflow:
               AND facility_mapping_id = {{ ctx.facility_mapping_id | int }}
             ORDER BY assessment_id
             FOR UPDATE SKIP LOCKED
-            LIMIT 1
+            LIMIT {{ __frame_max_rows | default(1) | int }}
           )
           UPDATE public.pft_test_mds_assessment_ids_work q
           SET status = 'claimed',
