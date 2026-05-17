@@ -38,7 +38,7 @@ PATIENT_RECORDS_MIN_PAGES = int(os.getenv("PATIENT_RECORDS_MIN_PAGES", "2"))
 PATIENT_RECORDS_MAX_PAGES = int(os.getenv("PATIENT_RECORDS_MAX_PAGES", "5"))
 PATIENT_RECORDS_PAYLOAD_KB = int(os.getenv("PATIENT_RECORDS_PAYLOAD_KB", "100"))
 CONCURRENCY_PROBE_MAX_EVENTS = int(os.getenv("CONCURRENCY_PROBE_MAX_EVENTS", "200"))
-PFT_RATE_LIMIT = int(os.getenv("PFT_RATE_LIMIT", "100"))
+PFT_RATE_LIMIT = int(os.getenv("PFT_RATE_LIMIT", "500"))
 
 # Track request attempts per page for flaky endpoint
 flaky_attempts = defaultdict(int)
