@@ -422,6 +422,12 @@ workflow:
       spec:
         mode: cursor
         max_in_flight: '{{ pft_http_concurrency | int }}'
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
     tool:
       - name: init_page
         kind: noop
@@ -614,6 +620,12 @@ workflow:
       spec:
         mode: cursor
         max_in_flight: '{{ pft_http_concurrency | int }}'
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
     tool:
       - name: init_page
         kind: noop
@@ -806,6 +818,12 @@ workflow:
       spec:
         mode: cursor
         max_in_flight: '{{ pft_http_concurrency | int }}'
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
     tool:
       - name: init_page
         kind: noop
@@ -998,6 +1016,12 @@ workflow:
       spec:
         mode: cursor
         max_in_flight: '{{ pft_http_concurrency | int }}'
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
     tool:
       - name: init_page
         kind: noop
@@ -1190,6 +1214,12 @@ workflow:
       spec:
         mode: cursor
         max_in_flight: '{{ pft_http_concurrency | int }}'
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
     tool:
       - name: fetch
         kind: http
@@ -1406,6 +1436,12 @@ workflow:
         mode: cursor
         # Match the patient-domain cursor cap for the one-record HTTP contract.
         max_in_flight: '{{ pft_http_concurrency | int }}'
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
     tool:
       - name: fetch
         kind: http
