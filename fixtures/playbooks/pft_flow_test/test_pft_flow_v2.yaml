@@ -421,7 +421,7 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: '{{ pft_http_concurrency | int }}'
+        max_in_flight: 8
         frame:
           max_rows: 50
           max_seconds: 30
@@ -619,7 +619,7 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: '{{ pft_http_concurrency | int }}'
+        max_in_flight: 8
         frame:
           max_rows: 50
           max_seconds: 30
@@ -817,7 +817,7 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: '{{ pft_http_concurrency | int }}'
+        max_in_flight: 8
         frame:
           max_rows: 50
           max_seconds: 30
@@ -1015,7 +1015,7 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: '{{ pft_http_concurrency | int }}'
+        max_in_flight: 8
         frame:
           max_rows: 50
           max_seconds: 30
@@ -1213,7 +1213,7 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: '{{ pft_http_concurrency | int }}'
+        max_in_flight: 8
         frame:
           max_rows: 50
           max_seconds: 30
@@ -1435,7 +1435,7 @@ workflow:
       spec:
         mode: cursor
         # Match the patient-domain cursor cap for the one-record HTTP contract.
-        max_in_flight: '{{ pft_http_concurrency | int }}'
+        max_in_flight: 8
         frame:
           max_rows: 50
           max_seconds: 30
