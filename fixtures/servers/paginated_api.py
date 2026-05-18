@@ -134,7 +134,7 @@ async def get_concurrency_stats():
 
 @app.get('/api/v1/concurrency/probe')
 async def run_concurrency_probe(
-    delay_seconds: float = Query(default=0.0, ge=0.0, le=60.0),
+    delay_seconds: float = Query(default=0.0, ge=0.0, le=300.0),
     label: str = Query(default="probe"),
 ):
     """
@@ -142,6 +142,8 @@ async def run_concurrency_probe(
 
     It intentionally sleeps using asyncio (non-blocking) so other requests can
     progress while this request is in-flight.
+    The 300s ceiling lets frame-lease regression fixtures wait past the
+    default 120s frame lease without adding a separate mock server.
     """
     started_at = time.time()
     request_id, active_at_start = await _record_probe_start(delay_seconds, label)

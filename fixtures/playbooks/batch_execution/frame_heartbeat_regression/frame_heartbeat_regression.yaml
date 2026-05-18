@@ -1,0 +1,214 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: frame_heartbeat_regression
+  path: fixtures/playbooks/batch_execution/frame_heartbeat_regression
+  description: |
+    Regression coverage for long-running cursor frames.
+
+    The cursor stage intentionally uses frame.process=frame and calls a slow
+    mock HTTP endpoint for longer than the default 120s frame lease. The
+    expected behavior is that the cursor worker emits frame heartbeats while
+    the frame task is still running, allowing the frame to commit instead of
+    becoming ABANDONED.
+
+workload:
+  api_url: "http://paginated-api.test-server.svc.cluster.local:5555"
+  pg_auth: pg_k8s
+  response_delay_seconds: 150
+  frame_lease_seconds: 120
+  frame_heartbeat_seconds: 30
+
+workflow:
+  - step: start
+    desc: Initialize the long-running frame heartbeat regression
+    tool:
+      kind: python
+      input:
+        response_delay_seconds: "{{ response_delay_seconds }}"
+        frame_lease_seconds: "{{ frame_lease_seconds }}"
+        frame_heartbeat_seconds: "{{ frame_heartbeat_seconds }}"
+      code: |
+        delay = int(response_delay_seconds or 150)
+        lease = int(frame_lease_seconds or 120)
+        heartbeat = int(frame_heartbeat_seconds or 30)
+        if delay <= lease:
+            raise RuntimeError(
+                f"response_delay_seconds={delay} must exceed frame_lease_seconds={lease}"
+            )
+        result = {
+            "status": "initialized",
+            "response_delay_seconds": delay,
+            "frame_lease_seconds": lease,
+            "frame_heartbeat_seconds": heartbeat,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: setup_work
+
+  - step: setup_work
+    desc: Seed one cursor work item for this execution
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      query: |
+        CREATE TABLE IF NOT EXISTS public.frame_heartbeat_regression_work (
+          execution_id TEXT NOT NULL,
+          work_id INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          claimed_at TIMESTAMPTZ,
+          completed_at TIMESTAMPTZ,
+          response JSONB,
+          PRIMARY KEY (execution_id, work_id)
+        );
+
+        DELETE FROM public.frame_heartbeat_regression_work
+        WHERE execution_id = '{{ execution_id }}';
+
+        INSERT INTO public.frame_heartbeat_regression_work (execution_id, work_id, status)
+        VALUES ('{{ execution_id }}', 1, 'pending');
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: run_slow_frame_cursor
+
+  - step: run_slow_frame_cursor
+    desc: Claim one runtime frame and keep process=frame while the HTTP call exceeds the frame lease
+    loop:
+      cursor:
+        kind: postgres
+        auth: pg_k8s
+        claim: |
+          WITH candidate AS (
+            SELECT work_id
+            FROM public.frame_heartbeat_regression_work
+            WHERE execution_id = '{{ execution_id }}'
+              AND status = 'pending'
+            ORDER BY work_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT {{ __frame_max_rows | default(1) | int }}
+          )
+          UPDATE public.frame_heartbeat_regression_work w
+          SET status = 'claimed',
+              claimed_at = NOW()
+          FROM candidate c
+          WHERE w.execution_id = '{{ execution_id }}'
+            AND w.work_id = c.work_id
+          RETURNING w.work_id;
+      iterator: probe
+      spec:
+        mode: cursor
+        max_in_flight: 1
+        frame:
+          max_rows: 1
+          max_seconds: 30
+          max_bytes: 1048576
+          lease_seconds: "{{ frame_lease_seconds }}"
+          heartbeat_seconds: "{{ frame_heartbeat_seconds }}"
+          row_concurrency: 1
+          process: frame
+    tool:
+      - name: slow_http_call
+        kind: http
+        method: GET
+        url: "{{ api_url }}/api/v1/concurrency/probe"
+        timeout: 210
+        params:
+          label: "frame-heartbeat-regression"
+          delay_seconds: "{{ response_delay_seconds }}"
+        spec:
+          policy:
+            rules:
+              - when: "{{ output.status == 'error' }}"
+                then: { do: fail }
+              - else:
+                  then: { do: continue }
+      - name: mark_done
+        kind: postgres
+        auth: "{{ pg_auth }}"
+        command: |
+          UPDATE public.frame_heartbeat_regression_work
+          SET status = 'done',
+              completed_at = NOW(),
+              response = '{{ output.data | tojson | replace("'", "''") }}'::jsonb
+          WHERE execution_id = '{{ execution_id }}'
+            AND work_id = {{ iter.probe[0].work_id | int }};
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: verify_frame_committed
+          when: "{{ event.name == 'loop.done' }}"
+
+  - step: verify_frame_committed
+    desc: Verify the long-running frame committed instead of being abandoned
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      query: |
+        SELECT
+          f.frame_id,
+          f.status,
+          f.lease_until,
+          f.completed_at,
+          COUNT(e.event_id) FILTER (WHERE e.event_type = 'frame.heartbeat') AS heartbeat_count,
+          COUNT(e.event_id) FILTER (WHERE e.event_type = 'frame.committed') AS committed_event_count,
+          COUNT(e.event_id) FILTER (WHERE e.status = 'ABANDONED') AS abandoned_event_count
+        FROM noetl.frame f
+        JOIN noetl.stage s ON s.stage_id = f.stage_id
+        LEFT JOIN noetl.event e ON e.frame_id = f.frame_id
+        WHERE f.execution_id = {{ execution_id }}
+          AND s.step_name = 'run_slow_frame_cursor'
+        GROUP BY f.frame_id, f.status, f.lease_until, f.completed_at
+        ORDER BY f.frame_id DESC
+        LIMIT 1;
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: assert_frame_heartbeat
+
+  - step: assert_frame_heartbeat
+    desc: Fail if the frame was abandoned or no heartbeat was emitted
+    tool:
+      kind: python
+      input:
+        db_result: "{{ verify_frame_committed }}"
+      code: |
+        rows = db_result.get("command_0", {}).get("rows", []) if isinstance(db_result, dict) else []
+        if not rows:
+            raise RuntimeError("No runtime frame found for run_slow_frame_cursor")
+
+        frame = rows[0]
+        status = str(frame.get("status") or "").upper()
+        heartbeat_count = int(frame.get("heartbeat_count") or 0)
+        committed_event_count = int(frame.get("committed_event_count") or 0)
+        abandoned_event_count = int(frame.get("abandoned_event_count") or 0)
+
+        if status != "COMPLETED":
+            raise RuntimeError(f"Expected frame status COMPLETED, got {status}: {frame}")
+        if heartbeat_count < 1:
+            raise RuntimeError(f"Expected at least one frame.heartbeat event: {frame}")
+        if committed_event_count < 1:
+            raise RuntimeError(f"Expected a frame.committed event: {frame}")
+        if abandoned_event_count:
+            raise RuntimeError(f"Frame emitted ABANDONED event(s): {frame}")
+
+        result = {
+            "status": "ok",
+            "frame_id": frame.get("frame_id"),
+            "frame_status": status,
+            "heartbeat_count": heartbeat_count,
+            "committed_event_count": committed_event_count,
+        }
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: End frame heartbeat regression
+    tool:
+      kind: python
+      code: |
+        result = {"status": "completed"}
