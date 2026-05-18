@@ -6,7 +6,7 @@ metadata:
   description: |
     Full-pipeline PFT flow test v2 — mirrors state_report_generation_prod_v13 without Snowflake.
 
-    Tests cursor-based one-record HTTP fetches with execution-scoped claim state.
+    Tests cursor-based frame HTTP fetches with execution-scoped claim state.
     If all patients across all facilities are processed, NoETL is stable and
     the production playbook should work.
 
@@ -228,7 +228,7 @@ workflow:
           PRIMARY KEY (execution_id, facility_mapping_id, data_type)
         );
 
-        -- RisingWave-style durable stage gate: the input table above is the
+        -- Durable stage gate: the input table above is the
         -- source of truth, and this table is the materialized one-shot
         -- checkpoint that lets exactly one branch advance to MDS.
         CREATE TABLE IF NOT EXISTS public.pft_test_facility_stage_gate (
@@ -375,11 +375,11 @@ workflow:
         - step: fetch_assessments
 
   # ------------------------------------------------------------------
-  # FETCH ASSESSMENTS (one record per call)
+  # FETCH ASSESSMENTS (frame batch)
   # ------------------------------------------------------------------
   - step: fetch_assessments
     desc: |
-      Cursor-driven per-patient fetch/save for assessments. The current facility
+      Cursor-driven frame fetch/save for assessments. The current facility
       is fully drained before the playbook advances to the next data type.
     loop:
       cursor:
@@ -428,37 +428,20 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          process: frame
     tool:
-      - name: init_page
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - else:
-                  then:
-                    do: continue
-                    set:
-                      iter.page: 1
-      - name: fetch_page
+      - name: fetch_batch
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/patient/assessments'
+        url: '{{ api_url }}/api/v1/pft/batch/assessments'
         timeout: 8
         params:
-          patientId: '{{ iter.patient.patient_id }}'
-          page: '{{ iter.page }}'
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
           pageSize: '{{ page_size }}'
+          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
-              - when: '{{ output.status == "error" and (output.http.status in [400, 404]) }}'
-                then:
-                  do: continue
-                  set:
-                    iter.has_more: false
-                    iter.page_data: {}
-                    iter.current_page: '{{ iter.page | int }}'
-                    iter.skip_save: true
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
@@ -467,63 +450,48 @@ workflow:
                   then:
                     do: continue
                     set:
-                      iter.has_more: '{{ output.data.data.paging.hasMore }}'
-                      iter.page_data: '{{ output.data.data.data }}'
-                      iter.current_page: '{{ output.data.data.paging.page }}'
-                      iter.skip_save: false
-      - name: save_page
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+      - name: save_batch
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH save_page AS (
+          WITH frame_rows AS (
+            SELECT patient_id, facility_mapping_id
+            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer)
+          ),
+          batch_rows AS (
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
+          ),
+          save_page AS (
             INSERT INTO public.pft_test_patient_assessments (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
             SELECT
-              {{ iter.patient.patient_id }},
-              {{ iter.patient.facility_mapping_id | int }},
-              {{ iter.current_page }},
-              '{{ iter.page_data | tojson | replace("'", "''") }}'::jsonb,
-              {{ 'false' if iter.has_more | string | lower == 'true' else 'true' }}
-            WHERE {{ 'false' if iter.skip_save | string | lower == 'true' else 'true' }}
+              patient_id,
+              facility_mapping_id,
+              page_number,
+              payload,
+              is_last_page
+            FROM batch_rows
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
           ),
           mark_done AS (
             UPDATE public.pft_test_patient_work_queue q
-            SET status = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN 'claimed'
-                  ELSE 'done'
-                END,
-                done_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.done_at
-                  ELSE NOW()
-                END,
-                worker_id = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.worker_id
-                  ELSE NULL
-                END,
-                claimed_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.claimed_at
-                  ELSE NULL
-                END,
+            SET status = 'done',
+                done_at = NOW(),
+                worker_id = NULL,
+                claimed_at = NULL,
                 updated_at = NOW()
+            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
+              AND q.facility_mapping_id = fr.facility_mapping_id
               AND q.data_type = 'assessments'
-              AND q.patient_id = {{ iter.patient.patient_id | int }}
+              AND q.patient_id = fr.patient_id
           )
           SELECT 1 AS ok;
-      - name: paginate
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - when: '{{ iter.has_more | string | lower == "true" }}'
-                then:
-                  do: jump
-                  to: fetch_page
-                  set:
-                    iter.page: '{{ (iter.page | int) + 1 }}'
     next:
       spec:
         mode: exclusive
@@ -573,11 +541,11 @@ workflow:
         - step: fetch_conditions
           when: '{{ (output.data.rows[0].data_count | default(0) | int) >= (workload.patients_per_facility | int) }}'
   # ------------------------------------------------------------------
-  # FETCH CONDITIONS (one record per call)
+  # FETCH CONDITIONS (frame batch)
   # ------------------------------------------------------------------
   - step: fetch_conditions
     desc: |
-      Cursor-driven per-patient fetch/save for conditions. The current facility
+      Cursor-driven frame fetch/save for conditions. The current facility
       is fully drained before the playbook advances to the next data type.
     loop:
       cursor:
@@ -626,37 +594,20 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          process: frame
     tool:
-      - name: init_page
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - else:
-                  then:
-                    do: continue
-                    set:
-                      iter.page: 1
-      - name: fetch_page
+      - name: fetch_batch
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/patient/conditions'
+        url: '{{ api_url }}/api/v1/pft/batch/conditions'
         timeout: 8
         params:
-          patientId: '{{ iter.patient.patient_id }}'
-          page: '{{ iter.page }}'
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
           pageSize: '{{ page_size }}'
+          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
-              - when: '{{ output.status == "error" and (output.http.status in [400, 404]) }}'
-                then:
-                  do: continue
-                  set:
-                    iter.has_more: false
-                    iter.page_data: {}
-                    iter.current_page: '{{ iter.page | int }}'
-                    iter.skip_save: true
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
@@ -665,63 +616,48 @@ workflow:
                   then:
                     do: continue
                     set:
-                      iter.has_more: '{{ output.data.data.paging.hasMore }}'
-                      iter.page_data: '{{ output.data.data.data }}'
-                      iter.current_page: '{{ output.data.data.paging.page }}'
-                      iter.skip_save: false
-      - name: save_page
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+      - name: save_batch
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH save_page AS (
+          WITH frame_rows AS (
+            SELECT patient_id, facility_mapping_id
+            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer)
+          ),
+          batch_rows AS (
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
+          ),
+          save_page AS (
             INSERT INTO public.pft_test_patient_conditions (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
             SELECT
-              {{ iter.patient.patient_id }},
-              {{ iter.patient.facility_mapping_id | int }},
-              {{ iter.current_page }},
-              '{{ iter.page_data | tojson | replace("'", "''") }}'::jsonb,
-              {{ 'false' if iter.has_more | string | lower == 'true' else 'true' }}
-            WHERE {{ 'false' if iter.skip_save | string | lower == 'true' else 'true' }}
+              patient_id,
+              facility_mapping_id,
+              page_number,
+              payload,
+              is_last_page
+            FROM batch_rows
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
           ),
           mark_done AS (
             UPDATE public.pft_test_patient_work_queue q
-            SET status = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN 'claimed'
-                  ELSE 'done'
-                END,
-                done_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.done_at
-                  ELSE NOW()
-                END,
-                worker_id = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.worker_id
-                  ELSE NULL
-                END,
-                claimed_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.claimed_at
-                  ELSE NULL
-                END,
+            SET status = 'done',
+                done_at = NOW(),
+                worker_id = NULL,
+                claimed_at = NULL,
                 updated_at = NOW()
+            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
+              AND q.facility_mapping_id = fr.facility_mapping_id
               AND q.data_type = 'conditions'
-              AND q.patient_id = {{ iter.patient.patient_id | int }}
+              AND q.patient_id = fr.patient_id
           )
           SELECT 1 AS ok;
-      - name: paginate
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - when: '{{ iter.has_more | string | lower == "true" }}'
-                then:
-                  do: jump
-                  to: fetch_page
-                  set:
-                    iter.page: '{{ (iter.page | int) + 1 }}'
     next:
       spec:
         mode: exclusive
@@ -771,11 +707,11 @@ workflow:
         - step: fetch_medications
           when: '{{ (output.data.rows[0].data_count | default(0) | int) >= (workload.patients_per_facility | int) }}'
   # ------------------------------------------------------------------
-  # FETCH MEDICATIONS (one record per call)
+  # FETCH MEDICATIONS (frame batch)
   # ------------------------------------------------------------------
   - step: fetch_medications
     desc: |
-      Cursor-driven per-patient fetch/save for medications. The current facility
+      Cursor-driven frame fetch/save for medications. The current facility
       is fully drained before the playbook advances to the next data type.
     loop:
       cursor:
@@ -824,37 +760,20 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          process: frame
     tool:
-      - name: init_page
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - else:
-                  then:
-                    do: continue
-                    set:
-                      iter.page: 1
-      - name: fetch_page
+      - name: fetch_batch
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/patient/medications'
+        url: '{{ api_url }}/api/v1/pft/batch/medications'
         timeout: 8
         params:
-          patientId: '{{ iter.patient.patient_id }}'
-          page: '{{ iter.page }}'
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
           pageSize: '{{ page_size }}'
+          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
-              - when: '{{ output.status == "error" and (output.http.status in [400, 404]) }}'
-                then:
-                  do: continue
-                  set:
-                    iter.has_more: false
-                    iter.page_data: {}
-                    iter.current_page: '{{ iter.page | int }}'
-                    iter.skip_save: true
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
@@ -863,63 +782,48 @@ workflow:
                   then:
                     do: continue
                     set:
-                      iter.has_more: '{{ output.data.data.paging.hasMore }}'
-                      iter.page_data: '{{ output.data.data.data }}'
-                      iter.current_page: '{{ output.data.data.paging.page }}'
-                      iter.skip_save: false
-      - name: save_page
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+      - name: save_batch
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH save_page AS (
+          WITH frame_rows AS (
+            SELECT patient_id, facility_mapping_id
+            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer)
+          ),
+          batch_rows AS (
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
+          ),
+          save_page AS (
             INSERT INTO public.pft_test_patient_medications (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
             SELECT
-              {{ iter.patient.patient_id }},
-              {{ iter.patient.facility_mapping_id | int }},
-              {{ iter.current_page }},
-              '{{ iter.page_data | tojson | replace("'", "''") }}'::jsonb,
-              {{ 'false' if iter.has_more | string | lower == 'true' else 'true' }}
-            WHERE {{ 'false' if iter.skip_save | string | lower == 'true' else 'true' }}
+              patient_id,
+              facility_mapping_id,
+              page_number,
+              payload,
+              is_last_page
+            FROM batch_rows
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
           ),
           mark_done AS (
             UPDATE public.pft_test_patient_work_queue q
-            SET status = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN 'claimed'
-                  ELSE 'done'
-                END,
-                done_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.done_at
-                  ELSE NOW()
-                END,
-                worker_id = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.worker_id
-                  ELSE NULL
-                END,
-                claimed_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.claimed_at
-                  ELSE NULL
-                END,
+            SET status = 'done',
+                done_at = NOW(),
+                worker_id = NULL,
+                claimed_at = NULL,
                 updated_at = NOW()
+            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
+              AND q.facility_mapping_id = fr.facility_mapping_id
               AND q.data_type = 'medications'
-              AND q.patient_id = {{ iter.patient.patient_id | int }}
+              AND q.patient_id = fr.patient_id
           )
           SELECT 1 AS ok;
-      - name: paginate
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - when: '{{ iter.has_more | string | lower == "true" }}'
-                then:
-                  do: jump
-                  to: fetch_page
-                  set:
-                    iter.page: '{{ (iter.page | int) + 1 }}'
     next:
       spec:
         mode: exclusive
@@ -969,11 +873,11 @@ workflow:
         - step: fetch_vital_signs
           when: '{{ (output.data.rows[0].data_count | default(0) | int) >= (workload.patients_per_facility | int) }}'
   # ------------------------------------------------------------------
-  # FETCH VITAL SIGNS (one record per call)
+  # FETCH VITAL SIGNS (frame batch)
   # ------------------------------------------------------------------
   - step: fetch_vital_signs
     desc: |
-      Cursor-driven per-patient fetch/save for vital signs. The current facility
+      Cursor-driven frame fetch/save for vital signs. The current facility
       is fully drained before the playbook advances to the next data type.
     loop:
       cursor:
@@ -1022,37 +926,20 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          process: frame
     tool:
-      - name: init_page
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - else:
-                  then:
-                    do: continue
-                    set:
-                      iter.page: 1
-      - name: fetch_page
+      - name: fetch_batch
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/patient/vital_signs'
+        url: '{{ api_url }}/api/v1/pft/batch/vital_signs'
         timeout: 8
         params:
-          patientId: '{{ iter.patient.patient_id }}'
-          page: '{{ iter.page }}'
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
           pageSize: '{{ page_size }}'
+          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
-              - when: '{{ output.status == "error" and (output.http.status in [400, 404]) }}'
-                then:
-                  do: continue
-                  set:
-                    iter.has_more: false
-                    iter.page_data: {}
-                    iter.current_page: '{{ iter.page | int }}'
-                    iter.skip_save: true
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
@@ -1061,63 +948,48 @@ workflow:
                   then:
                     do: continue
                     set:
-                      iter.has_more: '{{ output.data.data.paging.hasMore }}'
-                      iter.page_data: '{{ output.data.data.data }}'
-                      iter.current_page: '{{ output.data.data.paging.page }}'
-                      iter.skip_save: false
-      - name: save_page
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+      - name: save_batch
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH save_page AS (
+          WITH frame_rows AS (
+            SELECT patient_id, facility_mapping_id
+            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer)
+          ),
+          batch_rows AS (
+            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
+            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
+          ),
+          save_page AS (
             INSERT INTO public.pft_test_patient_vital_signs (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
             SELECT
-              {{ iter.patient.patient_id }},
-              {{ iter.patient.facility_mapping_id | int }},
-              {{ iter.current_page }},
-              '{{ iter.page_data | tojson | replace("'", "''") }}'::jsonb,
-              {{ 'false' if iter.has_more | string | lower == 'true' else 'true' }}
-            WHERE {{ 'false' if iter.skip_save | string | lower == 'true' else 'true' }}
+              patient_id,
+              facility_mapping_id,
+              page_number,
+              payload,
+              is_last_page
+            FROM batch_rows
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
           ),
           mark_done AS (
             UPDATE public.pft_test_patient_work_queue q
-            SET status = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN 'claimed'
-                  ELSE 'done'
-                END,
-                done_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.done_at
-                  ELSE NOW()
-                END,
-                worker_id = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.worker_id
-                  ELSE NULL
-                END,
-                claimed_at = CASE
-                  WHEN {{ 'true' if iter.has_more | string | lower == 'true' else 'false' }} THEN q.claimed_at
-                  ELSE NULL
-                END,
+            SET status = 'done',
+                done_at = NOW(),
+                worker_id = NULL,
+                claimed_at = NULL,
                 updated_at = NOW()
+            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
+              AND q.facility_mapping_id = fr.facility_mapping_id
               AND q.data_type = 'vital_signs'
-              AND q.patient_id = {{ iter.patient.patient_id | int }}
+              AND q.patient_id = fr.patient_id
           )
           SELECT 1 AS ok;
-      - name: paginate
-        kind: noop
-        spec:
-          policy:
-            rules:
-              - when: '{{ iter.has_more | string | lower == "true" }}'
-                then:
-                  do: jump
-                  to: fetch_page
-                  set:
-                    iter.page: '{{ (iter.page | int) + 1 }}'
     next:
       spec:
         mode: exclusive
@@ -1167,11 +1039,11 @@ workflow:
         - step: fetch_demographics
           when: '{{ (output.data.rows[0].data_count | default(0) | int) >= (workload.patients_per_facility | int) }}'
   # ------------------------------------------------------------------
-  # FETCH DEMOGRAPHICS (one record per call)
+  # FETCH DEMOGRAPHICS (frame batch)
   # ------------------------------------------------------------------
   - step: fetch_demographics
     desc: |
-      Cursor-driven per-patient fetch/save for demographics. The current
+      Cursor-driven frame fetch/save for demographics. The current
       facility is fully drained before MDS work begins.
     loop:
       cursor:
@@ -1220,23 +1092,19 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          process: frame
     tool:
-      - name: fetch
+      - name: fetch_batch
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/patient/demographics'
+        url: '{{ api_url }}/api/v1/pft/batch/demographics'
         timeout: 8
         params:
-          patientId: '{{ iter.patient.patient_id }}'
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
+          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
-              - when: '{{ output.status == "error" and (output.http.status in [400, 404]) }}'
-                then:
-                  do: continue
-                  set:
-                    iter.skip_save: true
-                    iter.fetch_data: {}
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
@@ -1245,35 +1113,40 @@ workflow:
                   then:
                     do: continue
                     set:
-                      iter.skip_save: false
-                      iter.fetch_data: '{{ output.data.data }}'
-      - name: save
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+      - name: save_batch
         kind: postgres
         auth: pg_k8s
         command: |
-          INSERT INTO public.pft_test_patient_demographics (pcc_patient_id, facility_mapping_id, payload)
-          SELECT
-            {{ iter.patient.patient_id }},
-            {{ iter.patient.facility_mapping_id | int }},
-            '{{ iter.fetch_data | tojson | replace("'", "''") }}'::jsonb
-          WHERE {{ 'false' if iter.skip_save | string | lower == 'true' else 'true' }}
-          ON CONFLICT (pcc_patient_id, facility_mapping_id) DO UPDATE SET
-            payload = EXCLUDED.payload,
-            fetched_at = NOW();
-      - name: mark_done
-        kind: postgres
-        auth: pg_k8s
-        command: |
+          WITH frame_rows AS (
+            SELECT patient_id, facility_mapping_id
+            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer)
+          ),
+          batch_rows AS (
+            SELECT patient_id, facility_mapping_id, payload
+            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(patient_id integer, facility_mapping_id integer, payload jsonb)
+          ),
+          save_rows AS (
+            INSERT INTO public.pft_test_patient_demographics (pcc_patient_id, facility_mapping_id, payload)
+            SELECT patient_id, facility_mapping_id, payload
+            FROM batch_rows
+            ON CONFLICT (pcc_patient_id, facility_mapping_id) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              fetched_at = NOW()
+          )
           UPDATE public.pft_test_patient_work_queue q
           SET status = 'done',
               done_at = NOW(),
               worker_id = NULL,
               claimed_at = NULL,
               updated_at = NOW()
+          FROM frame_rows fr
           WHERE q.execution_id = '{{ execution_id }}'
-            AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
+            AND q.facility_mapping_id = fr.facility_mapping_id
             AND q.data_type = 'demographics'
-            AND q.patient_id = {{ iter.patient.patient_id | int }};
+            AND q.patient_id = fr.patient_id;
     next:
       spec:
         mode: exclusive
@@ -1324,7 +1197,7 @@ workflow:
           when: '{{ (output.data.rows[0].data_count | default(0) | int) >= (workload.patients_per_facility | int) }}'
 
   # ------------------------------------------------------------------
-  # MDS DETAIL FETCHING (cursor HTTP, no batching)
+  # MDS DETAIL FETCHING (frame batch)
   # ------------------------------------------------------------------
   - step: prepare_mds_work
     desc: |
@@ -1348,7 +1221,7 @@ workflow:
             a.page_number,
             record
           FROM public.pft_test_patient_assessments a
-          CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS(a.payload) AS item(record)
+          CROSS JOIN LATERAL JSONB_ARRAY_ELEMENTS(a.payload->'data') AS item(record)
           WHERE a.facility_mapping_id = {{ ctx.facility_mapping_id | int }}
         ),
         mds_ids AS (
@@ -1399,8 +1272,8 @@ workflow:
 
   - step: fetch_mds_details
     desc: |
-      Cursor-driven MDS detail fetch/save. Each MDS ID is claimed and fetched
-      through the same bounded one-record HTTP pattern used by patient domains.
+      Cursor-driven MDS detail fetch/save. Each frame of MDS IDs is claimed and
+      fetched through the same bounded frame HTTP pattern used by patient domains.
     loop:
       cursor:
         kind: postgres
@@ -1434,7 +1307,6 @@ workflow:
       iterator: mds_row
       spec:
         mode: cursor
-        # Match the patient-domain cursor cap for the one-record HTTP contract.
         max_in_flight: 8
         frame:
           max_rows: 50
@@ -1442,12 +1314,15 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          process: frame
     tool:
-      - name: fetch
+      - name: fetch_batch
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/mds/assessment/{{ iter.mds_row.assessment_id }}'
+        url: '{{ api_url }}/api/v1/pft/mds/details'
         timeout: 8
+        params:
+          assessmentIds: "{{ frame.rows | map(attribute='assessment_id') | join(',') }}"
         spec:
           policy:
             rules:
@@ -1461,31 +1336,43 @@ workflow:
                   then:
                     do: continue
                     set:
-                      iter.detail: '{{ output.data.data }}'
-      - name: save
+                      iter.batch_rows: '{{ output.data.data.rows }}'
+      - name: save_batch
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH save_detail AS (
+          WITH frame_rows AS (
+            SELECT assessment_id, pcc_patient_id, facility_mapping_id
+            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(assessment_id text, pcc_patient_id integer, facility_mapping_id integer)
+          ),
+          batch_rows AS (
+            SELECT assessment_id, payload
+            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
+              AS r(assessment_id text, payload jsonb)
+          ),
+          save_detail AS (
             INSERT INTO public.pft_test_mds_assessment_details (
               assessment_id, pcc_patient_id, facility_mapping_id, payload
             )
-            VALUES (
-              '{{ iter.mds_row.assessment_id }}',
-              {{ iter.mds_row.pcc_patient_id }},
-              {{ iter.mds_row.facility_mapping_id | int }},
-              '{{ iter.detail | tojson | replace("'", "''") }}'::jsonb
-            )
+            SELECT
+              fr.assessment_id,
+              fr.pcc_patient_id,
+              fr.facility_mapping_id,
+              br.payload
+            FROM frame_rows fr
+            JOIN batch_rows br USING (assessment_id)
             ON CONFLICT (assessment_id) DO UPDATE SET
               payload = EXCLUDED.payload,
               fetched_at = NOW()
           )
-          UPDATE public.pft_test_mds_assessment_ids_work
+          UPDATE public.pft_test_mds_assessment_ids_work q
           SET status = 'done',
               done_at = NOW(),
               worker_id = NULL,
               updated_at = NOW()
-          WHERE assessment_id = '{{ iter.mds_row.assessment_id }}';
+          FROM frame_rows fr
+          WHERE q.assessment_id = fr.assessment_id;
         spec:
           policy:
             rules:
