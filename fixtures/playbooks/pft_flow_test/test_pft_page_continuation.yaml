@@ -1,0 +1,301 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: test_pft_page_continuation
+  path: fixtures/playbooks/pft_flow_test/test_pft_page_continuation
+  description: |
+    Companion PFT fixture for page-level API fidelity.
+
+    This intentionally does not replace or reshape test_pft_flow_v2. It focuses
+    only on the paginated patient-domain contract: each external HTTP request
+    fetches one patient/data-type/page record, and paging.hasMore is the only
+    mechanism that creates page_number + 1 work.
+
+workload:
+  api_url: http://paginated-api.test-server.svc.cluster.local:5555
+  pg_auth: pg_k8s
+  patient_count: 10
+  page_size: 1
+  data_types:
+    - assessments
+    - conditions
+    - medications
+    - vital_signs
+
+# Fidelity rule: the fixture endpoint must see one HTTP request for one logical
+# record. Do not convert this playbook to repeated IDs, comma IDs, or batch APIs.
+
+workflow:
+  - step: start
+    desc: Seed page-one work for every patient/data type
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        CREATE TABLE IF NOT EXISTS public.pft_page_continuation_work (
+          execution_id        TEXT        NOT NULL,
+          data_type           TEXT        NOT NULL,
+          patient_id          INTEGER     NOT NULL,
+          page_number         INTEGER     NOT NULL,
+          status              TEXT        NOT NULL,
+          attempt_count       INTEGER     NOT NULL DEFAULT 0,
+          worker_id           TEXT,
+          claimed_at          TIMESTAMPTZ,
+          done_at             TIMESTAMPTZ,
+          created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (execution_id, data_type, patient_id, page_number)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pft_page_continuation_pending
+          ON public.pft_page_continuation_work (execution_id, data_type, patient_id, page_number)
+          WHERE status = 'pending';
+
+        CREATE INDEX IF NOT EXISTS idx_pft_page_continuation_claimed
+          ON public.pft_page_continuation_work (execution_id, claimed_at, data_type, patient_id, page_number)
+          WHERE status = 'claimed';
+
+        CREATE TABLE IF NOT EXISTS public.pft_page_continuation_results (
+          execution_id        TEXT        NOT NULL,
+          data_type           TEXT        NOT NULL,
+          patient_id          INTEGER     NOT NULL,
+          page_number         INTEGER     NOT NULL,
+          payload             JSONB       NOT NULL,
+          has_more            BOOLEAN     NOT NULL,
+          total_pages         INTEGER     NOT NULL,
+          fetched_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (execution_id, data_type, patient_id, page_number)
+        );
+
+        DELETE FROM public.pft_page_continuation_work
+        WHERE execution_id = '{{ execution_id }}';
+
+        DELETE FROM public.pft_page_continuation_results
+        WHERE execution_id = '{{ execution_id }}';
+
+        INSERT INTO public.pft_page_continuation_work (
+          execution_id, data_type, patient_id, page_number, status
+        )
+        SELECT
+          '{{ execution_id }}',
+          data_type,
+          patient_id,
+          1,
+          'pending'
+        FROM (VALUES
+          ('assessments'),
+          ('conditions'),
+          ('medications'),
+          ('vital_signs')
+        ) AS dt(data_type)
+        CROSS JOIN generate_series(1, {{ patient_count | int }}) AS patients(patient_id)
+        ON CONFLICT (execution_id, data_type, patient_id, page_number) DO NOTHING;
+
+        SELECT COUNT(*) AS seeded_count
+        FROM public.pft_page_continuation_work
+        WHERE execution_id = '{{ execution_id }}';
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: fetch_pages
+
+  - step: fetch_pages
+    desc: Drain page work; each row is one singular HTTP request
+    loop:
+      cursor:
+        kind: postgres
+        auth: pg_k8s
+        claim: |
+          WITH reclaim_stale AS (
+            UPDATE public.pft_page_continuation_work
+            SET status = 'pending',
+                claimed_at = NULL,
+                worker_id = NULL,
+                updated_at = NOW()
+            WHERE execution_id = '{{ execution_id }}'
+              AND status = 'claimed'
+              AND claimed_at < NOW() - INTERVAL '5 minutes'
+          ),
+          candidate AS (
+            SELECT data_type, patient_id, page_number
+            FROM public.pft_page_continuation_work
+            WHERE execution_id = '{{ execution_id }}'
+              AND status = 'pending'
+            ORDER BY data_type, patient_id, page_number
+            FOR UPDATE SKIP LOCKED
+            LIMIT {{ __frame_max_rows | default(1) | int }}
+          )
+          UPDATE public.pft_page_continuation_work w
+          SET status = 'claimed',
+              attempt_count = w.attempt_count + 1,
+              worker_id = 'cursor:page-continuation',
+              claimed_at = NOW(),
+              updated_at = NOW()
+          FROM candidate c
+          WHERE w.execution_id = '{{ execution_id }}'
+            AND w.data_type = c.data_type
+            AND w.patient_id = c.patient_id
+            AND w.page_number = c.page_number
+          RETURNING w.data_type, w.patient_id, w.page_number;
+      iterator: page
+      spec:
+        mode: cursor
+        max_in_flight: 1
+        frame:
+          max_rows: 50
+          max_seconds: 30
+          max_bytes: 67108864
+          lease_seconds: 120
+          heartbeat_seconds: 30
+          row_concurrency: 1
+          process: row
+    tool:
+      - name: fetch_record
+        kind: http
+        method: GET
+        url: "{{ api_url }}/api/v1/patient/{{ iter.page.data_type }}"
+        timeout: 8
+        params:
+          patientId: "{{ iter.page.patient_id }}"
+          page: "{{ iter.page.page_number }}"
+          pageSize: "{{ page_size }}"
+        spec:
+          policy:
+            rules:
+              - when: '{{ output.status == "error" }}'
+                then:
+                  do: retry
+                  attempts: 6
+                  backoff: fixed
+                  delay: 1.0
+              - else:
+                  then:
+                    do: continue
+                    set:
+                      iter.page_payload: "{{ output.data.data }}"
+      - name: save_record
+        kind: postgres
+        auth: "{{ pg_auth }}"
+        command: |
+          WITH response AS (
+            SELECT '{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb AS payload
+          ),
+          save_page AS (
+            INSERT INTO public.pft_page_continuation_results (
+              execution_id, data_type, patient_id, page_number, payload, has_more, total_pages
+            )
+            SELECT
+              '{{ execution_id }}',
+              '{{ iter.page.data_type }}',
+              {{ iter.page.patient_id | int }},
+              {{ iter.page.page_number | int }},
+              payload,
+              COALESCE((payload->'paging'->>'hasMore')::boolean, FALSE),
+              COALESCE((payload->'paging'->>'total')::int, 1)
+            FROM response
+            ON CONFLICT (execution_id, data_type, patient_id, page_number) DO UPDATE SET
+              payload = EXCLUDED.payload,
+              has_more = EXCLUDED.has_more,
+              total_pages = EXCLUDED.total_pages,
+              fetched_at = NOW()
+          ),
+          enqueue_next AS (
+            INSERT INTO public.pft_page_continuation_work (
+              execution_id, data_type, patient_id, page_number, status
+            )
+            SELECT
+              '{{ execution_id }}',
+              '{{ iter.page.data_type }}',
+              {{ iter.page.patient_id | int }},
+              {{ iter.page.page_number | int }} + 1,
+              'pending'
+            FROM response
+            WHERE COALESCE((payload->'paging'->>'hasMore')::boolean, FALSE)
+            ON CONFLICT (execution_id, data_type, patient_id, page_number) DO NOTHING
+          )
+          UPDATE public.pft_page_continuation_work
+          SET status = 'done',
+              done_at = NOW(),
+              worker_id = NULL,
+              claimed_at = NULL,
+              updated_at = NOW()
+          WHERE execution_id = '{{ execution_id }}'
+            AND data_type = '{{ iter.page.data_type }}'
+            AND patient_id = {{ iter.page.patient_id | int }}
+            AND page_number = {{ iter.page.page_number | int }};
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: verify_pages
+          when: "{{ event.name == 'loop.done' }}"
+
+  - step: verify_pages
+    desc: Assert all queued pages drained and every patient/data type reached its terminal page
+    tool:
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        DO $$
+        DECLARE
+          open_work INTEGER;
+          incomplete_count INTEGER;
+          expected_pairs INTEGER := {{ patient_count | int }} * 4;
+          complete_pairs INTEGER;
+        BEGIN
+          SELECT COUNT(*) INTO open_work
+          FROM public.pft_page_continuation_work
+          WHERE execution_id = '{{ execution_id }}'
+            AND status <> 'done';
+
+          WITH per_pair AS (
+            SELECT
+              data_type,
+              patient_id,
+              COUNT(*) AS pages_done,
+              MAX(total_pages) AS total_pages,
+              BOOL_OR(has_more = FALSE) AS saw_terminal_page
+            FROM public.pft_page_continuation_results
+            WHERE execution_id = '{{ execution_id }}'
+            GROUP BY data_type, patient_id
+          )
+          SELECT
+            COUNT(*) FILTER (
+              WHERE pages_done = total_pages AND saw_terminal_page
+            ),
+            COUNT(*) FILTER (
+              WHERE pages_done <> total_pages OR NOT saw_terminal_page
+            )
+          INTO complete_pairs, incomplete_count
+          FROM per_pair;
+
+          IF open_work <> 0 THEN
+            RAISE EXCEPTION 'Expected no open page work, got %', open_work;
+          END IF;
+
+          IF complete_pairs <> expected_pairs THEN
+            RAISE EXCEPTION 'Expected % complete patient/data-type pairs, got %', expected_pairs, complete_pairs;
+          END IF;
+
+          IF COALESCE(incomplete_count, 0) <> 0 THEN
+            RAISE EXCEPTION 'Found % incomplete patient/data-type pair(s)', incomplete_count;
+          END IF;
+        END $$;
+
+        SELECT
+          'passed' AS status,
+          COUNT(*) AS records_fetched,
+          COUNT(DISTINCT data_type || ':' || patient_id::text) AS complete_pairs
+        FROM public.pft_page_continuation_results
+        WHERE execution_id = '{{ execution_id }}';
+    next:
+      spec: { mode: exclusive }
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Page continuation fixture complete
+    tool:
+      kind: python
+      code: |
+        result = {"status": "completed"}
