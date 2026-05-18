@@ -27,7 +27,11 @@ workload:
   page_size: 1
   num_facilities: 10
   patients_per_facility: 1000
-  pft_http_concurrency: 8
+  pft_http_concurrency: 1
+
+# PFT API fidelity rule: every external fixture call below must request exactly
+# one record. Cursor frames may claim multiple rows internally, but do not use
+# repeated IDs, comma-separated IDs, or fixture batch endpoints for speed.
 
 workflow:
   # ------------------------------------------------------------------
@@ -421,59 +425,52 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: 8
+        max_in_flight: 1
         frame:
           max_rows: 50
           max_seconds: 30
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
-          process: frame
+          row_concurrency: 1
+          process: row
     tool:
-      - name: fetch_batch
+      - name: fetch_record
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/pft/batch/assessments'
+        url: '{{ api_url }}/api/v1/patient/assessments'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
+          patientId: "{{ iter.patient.patient_id }}"
+          page: 1
           pageSize: '{{ page_size }}'
-          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
-                  attempts: 3
+                  attempts: 6
+                  backoff: fixed
+                  delay: 1.0
               - else:
                   then:
                     do: continue
                     set:
-                      iter.batch_rows: '{{ output.data.data.rows }}'
-      - name: save_batch
+                      iter.page_payload: '{{ output.data.data }}'
+      - name: save_record
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH frame_rows AS (
-            SELECT patient_id, facility_mapping_id
-            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer)
-          ),
-          batch_rows AS (
-            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
-            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
-          ),
-          save_page AS (
+          WITH save_page AS (
             INSERT INTO public.pft_test_patient_assessments (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
-            SELECT
-              patient_id,
-              facility_mapping_id,
-              page_number,
-              payload,
-              is_last_page
-            FROM batch_rows
+            VALUES (
+              {{ iter.patient.patient_id | int }},
+              {{ iter.patient.facility_mapping_id | int }},
+              1,
+              '{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb,
+              COALESCE(('{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb->'paging'->>'isLastPage')::boolean, TRUE)
+            )
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
@@ -485,11 +482,10 @@ workflow:
                 worker_id = NULL,
                 claimed_at = NULL,
                 updated_at = NOW()
-            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = fr.facility_mapping_id
+              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
               AND q.data_type = 'assessments'
-              AND q.patient_id = fr.patient_id
+              AND q.patient_id = {{ iter.patient.patient_id | int }}
           )
           SELECT 1 AS ok;
     next:
@@ -587,59 +583,52 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: 8
+        max_in_flight: 1
         frame:
           max_rows: 50
           max_seconds: 30
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
-          process: frame
+          row_concurrency: 1
+          process: row
     tool:
-      - name: fetch_batch
+      - name: fetch_record
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/pft/batch/conditions'
+        url: '{{ api_url }}/api/v1/patient/conditions'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
+          patientId: "{{ iter.patient.patient_id }}"
+          page: 1
           pageSize: '{{ page_size }}'
-          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
-                  attempts: 3
+                  attempts: 6
+                  backoff: fixed
+                  delay: 1.0
               - else:
                   then:
                     do: continue
                     set:
-                      iter.batch_rows: '{{ output.data.data.rows }}'
-      - name: save_batch
+                      iter.page_payload: '{{ output.data.data }}'
+      - name: save_record
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH frame_rows AS (
-            SELECT patient_id, facility_mapping_id
-            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer)
-          ),
-          batch_rows AS (
-            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
-            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
-          ),
-          save_page AS (
+          WITH save_page AS (
             INSERT INTO public.pft_test_patient_conditions (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
-            SELECT
-              patient_id,
-              facility_mapping_id,
-              page_number,
-              payload,
-              is_last_page
-            FROM batch_rows
+            VALUES (
+              {{ iter.patient.patient_id | int }},
+              {{ iter.patient.facility_mapping_id | int }},
+              1,
+              '{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb,
+              COALESCE(('{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb->'paging'->>'isLastPage')::boolean, TRUE)
+            )
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
@@ -651,11 +640,10 @@ workflow:
                 worker_id = NULL,
                 claimed_at = NULL,
                 updated_at = NOW()
-            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = fr.facility_mapping_id
+              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
               AND q.data_type = 'conditions'
-              AND q.patient_id = fr.patient_id
+              AND q.patient_id = {{ iter.patient.patient_id | int }}
           )
           SELECT 1 AS ok;
     next:
@@ -753,59 +741,52 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: 8
+        max_in_flight: 1
         frame:
           max_rows: 50
           max_seconds: 30
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
-          process: frame
+          row_concurrency: 1
+          process: row
     tool:
-      - name: fetch_batch
+      - name: fetch_record
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/pft/batch/medications'
+        url: '{{ api_url }}/api/v1/patient/medications'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
+          patientId: "{{ iter.patient.patient_id }}"
+          page: 1
           pageSize: '{{ page_size }}'
-          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
-                  attempts: 3
+                  attempts: 6
+                  backoff: fixed
+                  delay: 1.0
               - else:
                   then:
                     do: continue
                     set:
-                      iter.batch_rows: '{{ output.data.data.rows }}'
-      - name: save_batch
+                      iter.page_payload: '{{ output.data.data }}'
+      - name: save_record
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH frame_rows AS (
-            SELECT patient_id, facility_mapping_id
-            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer)
-          ),
-          batch_rows AS (
-            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
-            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
-          ),
-          save_page AS (
+          WITH save_page AS (
             INSERT INTO public.pft_test_patient_medications (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
-            SELECT
-              patient_id,
-              facility_mapping_id,
-              page_number,
-              payload,
-              is_last_page
-            FROM batch_rows
+            VALUES (
+              {{ iter.patient.patient_id | int }},
+              {{ iter.patient.facility_mapping_id | int }},
+              1,
+              '{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb,
+              COALESCE(('{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb->'paging'->>'isLastPage')::boolean, TRUE)
+            )
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
@@ -817,11 +798,10 @@ workflow:
                 worker_id = NULL,
                 claimed_at = NULL,
                 updated_at = NOW()
-            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = fr.facility_mapping_id
+              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
               AND q.data_type = 'medications'
-              AND q.patient_id = fr.patient_id
+              AND q.patient_id = {{ iter.patient.patient_id | int }}
           )
           SELECT 1 AS ok;
     next:
@@ -919,59 +899,52 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: 8
+        max_in_flight: 1
         frame:
           max_rows: 50
           max_seconds: 30
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
-          process: frame
+          row_concurrency: 1
+          process: row
     tool:
-      - name: fetch_batch
+      - name: fetch_record
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/pft/batch/vital_signs'
+        url: '{{ api_url }}/api/v1/patient/vital_signs'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
+          patientId: "{{ iter.patient.patient_id }}"
+          page: 1
           pageSize: '{{ page_size }}'
-          patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
             rules:
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
-                  attempts: 3
+                  attempts: 6
+                  backoff: fixed
+                  delay: 1.0
               - else:
                   then:
                     do: continue
                     set:
-                      iter.batch_rows: '{{ output.data.data.rows }}'
-      - name: save_batch
+                      iter.page_payload: '{{ output.data.data }}'
+      - name: save_record
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH frame_rows AS (
-            SELECT patient_id, facility_mapping_id
-            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer)
-          ),
-          batch_rows AS (
-            SELECT patient_id, facility_mapping_id, page_number, payload, is_last_page
-            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer, page_number integer, payload jsonb, is_last_page boolean)
-          ),
-          save_page AS (
+          WITH save_page AS (
             INSERT INTO public.pft_test_patient_vital_signs (pcc_patient_id, facility_mapping_id, page_number, payload, is_last_page)
-            SELECT
-              patient_id,
-              facility_mapping_id,
-              page_number,
-              payload,
-              is_last_page
-            FROM batch_rows
+            VALUES (
+              {{ iter.patient.patient_id | int }},
+              {{ iter.patient.facility_mapping_id | int }},
+              1,
+              '{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb,
+              COALESCE(('{{ iter.page_payload | tojson | replace("'", "''") }}'::jsonb->'paging'->>'isLastPage')::boolean, TRUE)
+            )
             ON CONFLICT (pcc_patient_id, facility_mapping_id, page_number) DO UPDATE SET
               payload = EXCLUDED.payload,
               is_last_page = EXCLUDED.is_last_page
@@ -983,11 +956,10 @@ workflow:
                 worker_id = NULL,
                 claimed_at = NULL,
                 updated_at = NOW()
-            FROM frame_rows fr
             WHERE q.execution_id = '{{ execution_id }}'
-              AND q.facility_mapping_id = fr.facility_mapping_id
+              AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
               AND q.data_type = 'vital_signs'
-              AND q.patient_id = fr.patient_id
+              AND q.patient_id = {{ iter.patient.patient_id | int }}
           )
           SELECT 1 AS ok;
     next:
@@ -1085,53 +1057,48 @@ workflow:
       iterator: patient
       spec:
         mode: cursor
-        max_in_flight: 8
+        max_in_flight: 1
         frame:
           max_rows: 50
           max_seconds: 30
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
-          process: frame
+          row_concurrency: 1
+          process: row
     tool:
-      - name: fetch_batch
+      - name: fetch_record
         kind: http
         method: GET
-        url: '{{ api_url }}/api/v1/pft/batch/demographics'
+        url: '{{ api_url }}/api/v1/patient/demographics'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
-          patientsPerFacility: '{{ workload.patients_per_facility }}'
+          patientId: "{{ iter.patient.patient_id }}"
         spec:
           policy:
             rules:
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
-                  attempts: 3
+                  attempts: 6
+                  backoff: fixed
+                  delay: 1.0
               - else:
                   then:
                     do: continue
                     set:
-                      iter.batch_rows: '{{ output.data.data.rows }}'
-      - name: save_batch
+                      iter.record_payload: '{{ output.data.data }}'
+      - name: save_record
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH frame_rows AS (
-            SELECT patient_id, facility_mapping_id
-            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer)
-          ),
-          batch_rows AS (
-            SELECT patient_id, facility_mapping_id, payload
-            FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(patient_id integer, facility_mapping_id integer, payload jsonb)
-          ),
-          save_rows AS (
+          WITH save_rows AS (
             INSERT INTO public.pft_test_patient_demographics (pcc_patient_id, facility_mapping_id, payload)
-            SELECT patient_id, facility_mapping_id, payload
-            FROM batch_rows
+            VALUES (
+              {{ iter.patient.patient_id | int }},
+              {{ iter.patient.facility_mapping_id | int }},
+              '{{ iter.record_payload | tojson | replace("'", "''") }}'::jsonb
+            )
             ON CONFLICT (pcc_patient_id, facility_mapping_id) DO UPDATE SET
               payload = EXCLUDED.payload,
               fetched_at = NOW()
@@ -1142,11 +1109,10 @@ workflow:
               worker_id = NULL,
               claimed_at = NULL,
               updated_at = NOW()
-          FROM frame_rows fr
           WHERE q.execution_id = '{{ execution_id }}'
-            AND q.facility_mapping_id = fr.facility_mapping_id
+            AND q.facility_mapping_id = {{ iter.patient.facility_mapping_id | int }}
             AND q.data_type = 'demographics'
-            AND q.patient_id = fr.patient_id;
+            AND q.patient_id = {{ iter.patient.patient_id | int }};
     next:
       spec:
         mode: exclusive
@@ -1307,29 +1273,30 @@ workflow:
       iterator: mds_row
       spec:
         mode: cursor
-        max_in_flight: 8
+        max_in_flight: 1
         frame:
           max_rows: 50
           max_seconds: 30
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
-          process: frame
+          row_concurrency: 1
+          process: row
     tool:
-      - name: fetch_batch
+      - name: fetch_record
         kind: http
         method: GET
         url: '{{ api_url }}/api/v1/pft/mds/details'
         timeout: 8
         params:
-          assessmentIds: "{{ frame.rows | map(attribute='assessment_id') | list }}"
+          assessmentId: "{{ iter.mds_row.assessment_id }}"
         spec:
           policy:
             rules:
               - when: '{{ output.status == "error" }}'
                 then:
                   do: retry
-                  attempts: 3
+                  attempts: 6
                   backoff: exponential
                   delay: 0.5
               - else:
@@ -1337,16 +1304,11 @@ workflow:
                     do: continue
                     set:
                       iter.batch_rows: '{{ output.data.data.rows }}'
-      - name: save_batch
+      - name: save_record
         kind: postgres
         auth: pg_k8s
         command: |
-          WITH frame_rows AS (
-            SELECT assessment_id, pcc_patient_id, facility_mapping_id
-            FROM jsonb_to_recordset('{{ frame.rows | tojson | replace("'", "''") }}'::jsonb)
-              AS r(assessment_id text, pcc_patient_id integer, facility_mapping_id integer)
-          ),
-          batch_rows AS (
+          WITH batch_rows AS (
             SELECT assessment_id, payload
             FROM jsonb_to_recordset('{{ iter.batch_rows | tojson | replace("'", "''") }}'::jsonb)
               AS r(assessment_id text, payload jsonb)
@@ -1356,12 +1318,12 @@ workflow:
               assessment_id, pcc_patient_id, facility_mapping_id, payload
             )
             SELECT
-              fr.assessment_id,
-              fr.pcc_patient_id,
-              fr.facility_mapping_id,
+              '{{ iter.mds_row.assessment_id }}',
+              {{ iter.mds_row.pcc_patient_id | int }},
+              {{ iter.mds_row.facility_mapping_id | int }},
               br.payload
-            FROM frame_rows fr
-            JOIN batch_rows br USING (assessment_id)
+            FROM batch_rows br
+            WHERE br.assessment_id = '{{ iter.mds_row.assessment_id }}'
             ON CONFLICT (assessment_id) DO UPDATE SET
               payload = EXCLUDED.payload,
               fetched_at = NOW()
@@ -1371,8 +1333,7 @@ workflow:
               done_at = NOW(),
               worker_id = NULL,
               updated_at = NOW()
-          FROM frame_rows fr
-          WHERE q.assessment_id = fr.assessment_id;
+          WHERE q.assessment_id = '{{ iter.mds_row.assessment_id }}';
         spec:
           policy:
             rules:

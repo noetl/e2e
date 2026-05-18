@@ -38,7 +38,7 @@ PATIENT_RECORDS_MIN_PAGES = int(os.getenv("PATIENT_RECORDS_MIN_PAGES", "2"))
 PATIENT_RECORDS_MAX_PAGES = int(os.getenv("PATIENT_RECORDS_MAX_PAGES", "5"))
 PATIENT_RECORDS_PAYLOAD_KB = int(os.getenv("PATIENT_RECORDS_PAYLOAD_KB", "100"))
 CONCURRENCY_PROBE_MAX_EVENTS = int(os.getenv("CONCURRENCY_PROBE_MAX_EVENTS", "200"))
-PFT_RATE_LIMIT = int(os.getenv("PFT_RATE_LIMIT", "500"))
+PFT_RATE_LIMIT = int(os.getenv("PFT_RATE_LIMIT", "50"))
 
 # Track request attempts per page for flaky endpoint
 flaky_attempts = defaultdict(int)
@@ -134,7 +134,7 @@ async def get_concurrency_stats():
 
 @app.get('/api/v1/concurrency/probe')
 async def run_concurrency_probe(
-    delay_seconds: float = Query(default=0.0, ge=0.0, le=60.0),
+    delay_seconds: float = Query(default=0.0, ge=0.0, le=300.0),
     label: str = Query(default="probe"),
 ):
     """
@@ -142,6 +142,8 @@ async def run_concurrency_probe(
 
     It intentionally sleeps using asyncio (non-blocking) so other requests can
     progress while this request is in-flight.
+    The 300s ceiling lets frame-lease regression fixtures wait past the
+    default 120s frame lease without adding a separate mock server.
     """
     started_at = time.time()
     request_id, active_at_start = await _record_probe_start(delay_seconds, label)
@@ -1055,127 +1057,46 @@ def _pft_facility_mapping_id(patient_id: int, patients_per_facility: int) -> int
     return ((patient_id - 1) // max(1, patients_per_facility)) + 1
 
 
-def _require_repeated_query_values(value: list[str], parameter_name: str) -> list[str]:
-    values = [str(item).strip() for item in value if str(item).strip()]
-    if any("," in item for item in values):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{parameter_name} must be repeated query parameters, not comma-separated values",
-        )
-    return values
-
-
-def _pft_batch_patient_ids(patientIds: list[str]) -> list[int]:
-    ids: list[int] = []
-    for text in _require_repeated_query_values(patientIds, "patientIds"):
-        ids.append(int(text))
-    if not ids:
-        raise HTTPException(status_code=400, detail="patientIds must contain at least one patient id")
-    if len(ids) > 500:
-        raise HTTPException(status_code=400, detail="patientIds may contain at most 500 patient ids")
-    return ids
-
-
 @app.get('/api/v1/pft/batch/{data_type}')
-def get_pft_batch(
-    data_type: str,
-    patientIds: list[str] = Query(..., description="Repeated patient ID query parameters"),
-    page: int = Query(default=1, ge=1),
-    pageSize: int = Query(default=10, ge=1),
-    patientsPerFacility: int = Query(default=1000, ge=1),
-):
-    """Return normalized PFT rows for a batch of patients.
+def get_pft_batch_disabled(data_type: str):
+    """Reject fixture-side batching for PFT.
 
-    This endpoint is intentionally fixture-scoped. It now mirrors the stricter
-    API contract used by the PFT flow: callers may request a bounded patient
-    frame, and the fixture enforces a global 50 req/s limit.
+    Keep this intentionally disabled: PFT must emulate the real API contract
+    where every HTTP request returns exactly one record. Do not reintroduce
+    repeated IDs, comma-separated IDs, or multi-record response optimizations.
     """
     _enforce_pft_rate_limit()
-    patient_ids = _pft_batch_patient_ids(patientIds)
-    rows = []
-
-    if data_type in {"assessments", "conditions", "medications", "vital_signs"}:
-        page_bounds = {
-            "assessments": (2, 4),
-            "conditions": (1, 3),
-            "medications": (2, 3),
-            "vital_signs": (1, 1),
-        }
-        min_pages, max_pages = page_bounds[data_type]
-        for patient_id in patient_ids:
-            facility_mapping_id = _pft_facility_mapping_id(patient_id, patientsPerFacility)
-            total_pages = _pft_page_count(str(patient_id), data_type, min_pages, max_pages)
-            for page_number in range(1, total_pages + 1):
-                rows.append(
-                    {
-                        "patient_id": patient_id,
-                        "facility_mapping_id": facility_mapping_id,
-                        "page_number": page_number,
-                        "payload": _pft_single_page_payload(str(patient_id), data_type, page_number, total_pages),
-                        "is_last_page": page_number == total_pages,
-                    }
-                )
-    elif data_type == "demographics":
-        for patient_id in patient_ids:
-            facility_mapping_id = _pft_facility_mapping_id(patient_id, patientsPerFacility)
-            seed = int(hashlib.md5(f"{patient_id}:demographics".encode()).hexdigest(), 16)
-            rows.append(
-                {
-                    "patient_id": patient_id,
-                    "facility_mapping_id": facility_mapping_id,
-                    "payload": {
-                        "patientId": str(patient_id),
-                        "firstName": f"First{seed % 1000}",
-                        "lastName": f"Last{(seed >> 8) % 1000}",
-                        "dob": f"19{50 + seed % 50}-{1 + seed % 12:02d}-{1 + (seed >> 4) % 28:02d}",
-                        "gender": "M" if seed % 2 == 0 else "F",
-                        "status": "active",
-                    },
-                }
-            )
-    elif data_type == "mds":
-        for patient_id in patient_ids:
-            facility_mapping_id = _pft_facility_mapping_id(patient_id, patientsPerFacility)
-            assessment_last_page = _pft_page_count(str(patient_id), "assessments", 2, 4)
-            assessment_id = f"MDS-{patient_id}-{assessment_last_page}"
-            rows.append(
-                {
-                    "patient_id": patient_id,
-                    "facility_mapping_id": facility_mapping_id,
-                    "assessment_id": assessment_id,
-                    "payload": _pft_mds_assessment_detail(assessment_id),
-                }
-            )
-    else:
-        raise HTTPException(status_code=400, detail=f"unsupported PFT batch data_type: {data_type}")
-
-    return {
-        "dataType": data_type,
-        "patientCount": len(patient_ids),
-        "rowCount": len(rows),
-        "rows": rows,
-    }
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "PFT batch endpoints are disabled; use the singular per-record "
+            "endpoints so 1 HTTP request returns 1 record."
+        ),
+    )
 
 
 @app.get('/api/v1/pft/mds/details')
 def get_pft_mds_details(
-    assessmentIds: list[str] = Query(..., description="Repeated MDS assessment ID query parameters"),
+    assessmentId: str = Query(..., description="Single MDS assessment ID"),
 ):
-    """Return normalized MDS detail rows for a bounded assessment frame."""
+    """Return one normalized MDS detail row."""
     _enforce_pft_rate_limit()
-    ids = _require_repeated_query_values(assessmentIds, "assessmentIds")
-    if not ids:
-        raise HTTPException(status_code=400, detail="assessmentIds must contain at least one assessment id")
-    if len(ids) > 500:
-        raise HTTPException(status_code=400, detail="assessmentIds may contain at most 500 assessment ids")
+    assessment_id = str(assessmentId).strip()
+    if not assessment_id:
+        raise HTTPException(status_code=400, detail="assessmentId must contain one assessment id")
+    if "," in assessment_id:
+        raise HTTPException(status_code=400, detail="assessmentId must contain exactly one assessment id")
+
+    # Keep this endpoint intentionally unbatched: it emulates the real API
+    # contract where one HTTP request returns one MDS record. Do not optimize
+    # it back into repeated IDs or multi-record responses for PFT speed.
     return {
-        "rowCount": len(ids),
+        "rowCount": 1,
         "rows": [
             {
                 "assessment_id": assessment_id,
                 "payload": _pft_mds_assessment_detail(assessment_id),
             }
-            for assessment_id in ids
         ],
     }
 
