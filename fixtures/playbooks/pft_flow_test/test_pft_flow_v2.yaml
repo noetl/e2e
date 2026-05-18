@@ -428,6 +428,7 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          row_concurrency: 4
     tool:
       - name: init_page
         kind: noop
@@ -626,6 +627,7 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          row_concurrency: 4
     tool:
       - name: init_page
         kind: noop
@@ -824,6 +826,7 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          row_concurrency: 4
     tool:
       - name: init_page
         kind: noop
@@ -1022,6 +1025,7 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          row_concurrency: 4
     tool:
       - name: init_page
         kind: noop
@@ -1220,6 +1224,7 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          row_concurrency: 4
     tool:
       - name: fetch
         kind: http
@@ -1442,6 +1447,7 @@ workflow:
           max_bytes: 67108864
           lease_seconds: 120
           heartbeat_seconds: 30
+          row_concurrency: 4
     tool:
       - name: fetch
         kind: http
