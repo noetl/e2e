@@ -1055,18 +1055,19 @@ def _pft_facility_mapping_id(patient_id: int, patients_per_facility: int) -> int
     return ((patient_id - 1) // max(1, patients_per_facility)) + 1
 
 
-def _join_query_values(value: str | list[str]) -> str:
-    if isinstance(value, list):
-        return ",".join(str(item) for item in value)
-    return str(value)
+def _require_repeated_query_values(value: list[str], parameter_name: str) -> list[str]:
+    values = [str(item).strip() for item in value if str(item).strip()]
+    if any("," in item for item in values):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{parameter_name} must be repeated query parameters, not comma-separated values",
+        )
+    return values
 
 
-def _pft_batch_patient_ids(patientIds: str | list[str]) -> list[int]:
+def _pft_batch_patient_ids(patientIds: list[str]) -> list[int]:
     ids: list[int] = []
-    for raw in _join_query_values(patientIds).split(","):
-        text = raw.strip()
-        if not text:
-            continue
+    for text in _require_repeated_query_values(patientIds, "patientIds"):
         ids.append(int(text))
     if not ids:
         raise HTTPException(status_code=400, detail="patientIds must contain at least one patient id")
@@ -1078,7 +1079,7 @@ def _pft_batch_patient_ids(patientIds: str | list[str]) -> list[int]:
 @app.get('/api/v1/pft/batch/{data_type}')
 def get_pft_batch(
     data_type: str,
-    patientIds: str | list[str] = Query(..., description="Comma-separated or repeated patient IDs"),
+    patientIds: list[str] = Query(..., description="Repeated patient ID query parameters"),
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=10, ge=1),
     patientsPerFacility: int = Query(default=1000, ge=1),
@@ -1158,11 +1159,11 @@ def get_pft_batch(
 
 @app.get('/api/v1/pft/mds/details')
 def get_pft_mds_details(
-    assessmentIds: str | list[str] = Query(..., description="Comma-separated or repeated MDS assessment IDs"),
+    assessmentIds: list[str] = Query(..., description="Repeated MDS assessment ID query parameters"),
 ):
     """Return normalized MDS detail rows for a bounded assessment frame."""
     _enforce_pft_rate_limit()
-    ids = [raw.strip() for raw in _join_query_values(assessmentIds).split(",") if raw.strip()]
+    ids = _require_repeated_query_values(assessmentIds, "assessmentIds")
     if not ids:
         raise HTTPException(status_code=400, detail="assessmentIds must contain at least one assessment id")
     if len(ids) > 500:

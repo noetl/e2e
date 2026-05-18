@@ -436,7 +436,7 @@ workflow:
         url: '{{ api_url }}/api/v1/pft/batch/assessments'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
           pageSize: '{{ page_size }}'
           patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
@@ -602,7 +602,7 @@ workflow:
         url: '{{ api_url }}/api/v1/pft/batch/conditions'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
           pageSize: '{{ page_size }}'
           patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
@@ -768,7 +768,7 @@ workflow:
         url: '{{ api_url }}/api/v1/pft/batch/medications'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
           pageSize: '{{ page_size }}'
           patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
@@ -934,7 +934,7 @@ workflow:
         url: '{{ api_url }}/api/v1/pft/batch/vital_signs'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
           pageSize: '{{ page_size }}'
           patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
@@ -1100,7 +1100,7 @@ workflow:
         url: '{{ api_url }}/api/v1/pft/batch/demographics'
         timeout: 8
         params:
-          patientIds: "{{ frame.rows | map(attribute='patient_id') | join(',') }}"
+          patientIds: "{{ frame.rows | map(attribute='patient_id') | list }}"
           patientsPerFacility: '{{ workload.patients_per_facility }}'
         spec:
           policy:
@@ -1322,7 +1322,7 @@ workflow:
         url: '{{ api_url }}/api/v1/pft/mds/details'
         timeout: 8
         params:
-          assessmentIds: "{{ frame.rows | map(attribute='assessment_id') | join(',') }}"
+          assessmentIds: "{{ frame.rows | map(attribute='assessment_id') | list }}"
         spec:
           policy:
             rules:
