@@ -83,11 +83,12 @@ workflow:
           patient_id,
           1,
           'pending'
-        FROM UNNEST(ARRAY[
-          {% for data_type in data_types -%}
-          '{{ data_type }}'{% if not loop.last %},{% endif %}
-          {%- endfor %}
-        ]::text[]) AS dt(data_type)
+        FROM (VALUES
+          ('assessments'),
+          ('conditions'),
+          ('medications'),
+          ('vital_signs')
+        ) AS dt(data_type)
         CROSS JOIN generate_series(1, {{ patient_count | int }}) AS patients(patient_id)
         ON CONFLICT (execution_id, data_type, patient_id, page_number) DO NOTHING;
 
@@ -239,7 +240,7 @@ workflow:
         DECLARE
           open_work INTEGER;
           incomplete_count INTEGER;
-          expected_pairs INTEGER := {{ patient_count | int }} * {{ data_types | length }};
+          expected_pairs INTEGER := {{ patient_count | int }} * 4;
           complete_pairs INTEGER;
         BEGIN
           SELECT COUNT(*) INTO open_work
