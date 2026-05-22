@@ -1,0 +1,241 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: glut_probe_design_structure_registry
+  path: tenants/glut-probe-design/projects/glut-probe-design/data/structures/registry
+  description: Download, validate, and publish the GLUT raw structure registry.
+
+executor:
+  profile: local
+  version: noetl-runtime/1
+
+workload:
+  tenant_id: glut-probe-design
+  organization_id: kadyapam
+  project_id: glut-probe-design
+  project_repo: /Volumes/X10/projects/noetl/ai-meta/repos/glut-probe-design
+  bucket_uri: gs://glut-probe-design
+  structures_prefix: data/structures
+  download_raw: "true"
+  upload_to_gcs: "true"
+  cleanup_local_raw: "true"
+
+workflow:
+  - step: validate_context
+    desc: Validate tenant, repository, and registry inputs
+    tool:
+      kind: python
+      code: |
+        from pathlib import Path
+
+        expected = {
+            "tenant_id": "glut-probe-design",
+            "organization_id": "kadyapam",
+            "project_id": "glut-probe-design",
+        }
+        errors = []
+        for key, value in expected.items():
+            if str(ctx.get(key, "")) != value:
+                errors.append(f"{key}={ctx.get(key)!r}, expected {value!r}")
+
+        project_repo = Path(str(ctx.get("project_repo", "")))
+        if not project_repo.exists():
+            errors.append(f"project_repo does not exist: {project_repo}")
+        if not (project_repo / "scripts" / "collect_glut_structures.py").exists():
+            errors.append("scripts/collect_glut_structures.py is missing")
+
+        bucket_uri = str(ctx.get("bucket_uri", "")).rstrip("/")
+        structures_prefix = str(ctx.get("structures_prefix", "")).strip("/")
+        if not bucket_uri.startswith("gs://"):
+            errors.append(f"bucket_uri must start with gs://, got {bucket_uri!r}")
+        if structures_prefix != "data/structures":
+            errors.append(f"structures_prefix must be data/structures, got {structures_prefix!r}")
+
+        if errors:
+            raise ValueError("; ".join(errors))
+
+        result = {
+            "status": "ok",
+            "tenant_id": ctx["tenant_id"],
+            "organization_id": ctx["organization_id"],
+            "project_id": ctx["project_id"],
+            "project_repo": str(project_repo),
+            "structures_uri": f"{bucket_uri}/{structures_prefix}",
+        }
+    next:
+      arcs:
+        - step: collect_structures
+
+  - step: collect_structures
+    desc: Run T02 collector and write the local manifest
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          cd "{{ workload.project_repo }}"
+          if [ "{{ workload.download_raw }}" = "true" ]; then
+            python scripts/collect_glut_structures.py
+          else
+            python scripts/collect_glut_structures.py --skip-download
+          fi
+    next:
+      arcs:
+        - step: write_metadata_index
+
+  - step: write_metadata_index
+    desc: Add tenant and GCS metadata without embedding raw PDB bytes
+    tool:
+      kind: python
+      code: |
+        import hashlib
+        import json
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        root = Path(str(ctx["project_repo"]))
+        manifest_path = root / "data" / "structures" / "manifest.json"
+        index_path = root / "data" / "structures" / "metadata_index.json"
+        summary_path = root / "results" / "noetl" / "structure_registry_summary.json"
+
+        manifest = json.loads(manifest_path.read_text())
+        bucket_uri = str(ctx["bucket_uri"]).rstrip("/")
+        structures_prefix = str(ctx["structures_prefix"]).strip("/")
+        structures_uri = f"{bucket_uri}/{structures_prefix}"
+
+        records = []
+        counts = {}
+        for row in manifest:
+            record = dict(row)
+            record.update(
+                {
+                    "tenant_id": ctx["tenant_id"],
+                    "organization_id": ctx["organization_id"],
+                    "project_id": ctx["project_id"],
+                    "dataset": "structures",
+                }
+            )
+
+            local_pdb_path = row.get("local_pdb_path")
+            if local_pdb_path:
+                local_path = Path(local_pdb_path)
+                rel_path = local_path.relative_to(root).as_posix()
+                record["project_relative_path"] = rel_path
+                record["gcs_uri"] = f"{bucket_uri}/{rel_path}"
+                if local_path.exists():
+                    record["sha256"] = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                    record["size_bytes"] = local_path.stat().st_size
+            else:
+                record["gcs_uri"] = None
+
+            status = str(record.get("status", "unknown"))
+            counts[status] = counts.get(status, 0) + 1
+            records.append(record)
+
+        metadata_index = {
+            "tenant_id": ctx["tenant_id"],
+            "organization_id": ctx["organization_id"],
+            "project_id": ctx["project_id"],
+            "dataset": "structures",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "structures_uri": structures_uri,
+            "records": records,
+        }
+        index_path.write_text(json.dumps(metadata_index, indent=2))
+
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "tenant_id": ctx["tenant_id"],
+            "organization_id": ctx["organization_id"],
+            "project_id": ctx["project_id"],
+            "dataset": "structures",
+            "status_counts": counts,
+            "manifest_path": str(manifest_path.relative_to(root)),
+            "metadata_index_path": str(index_path.relative_to(root)),
+            "structures_uri": structures_uri,
+            "postgres_policy": "metadata_and_uris_only",
+        }
+        summary_path.write_text(json.dumps(summary, indent=2))
+        result = summary
+    next:
+      arcs:
+        - step: upload_registry
+
+  - step: upload_registry
+    desc: Upload manifest, metadata index, and raw PDB objects to GCS
+    spec:
+      policy:
+        admit:
+          rules:
+            - when: "{{ ctx.upload_to_gcs == 'true' }}"
+              then: { allow: true }
+            - else:
+                then: { allow: false }
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          cd "{{ workload.project_repo }}"
+          gcloud storage rsync --recursive \
+            --exclude='.*\.gitkeep$' \
+            data/structures \
+            "{{ workload.bucket_uri }}/{{ workload.structures_prefix }}"
+          gcloud storage cp \
+            results/noetl/structure_registry_summary.json \
+            "{{ workload.bucket_uri }}/{{ workload.structures_prefix }}/runs/latest/structure_registry_summary.json"
+    next:
+      arcs:
+        - step: verify_registry
+
+  - step: verify_registry
+    desc: Verify expected registry objects in GCS
+    spec:
+      policy:
+        admit:
+          rules:
+            - when: "{{ ctx.upload_to_gcs == 'true' }}"
+              then: { allow: true }
+            - else:
+                then: { allow: false }
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          gcloud storage ls "{{ workload.bucket_uri }}/{{ workload.structures_prefix }}/manifest.json"
+          gcloud storage ls "{{ workload.bucket_uri }}/{{ workload.structures_prefix }}/metadata_index.json"
+          gcloud storage du --summarize "{{ workload.bucket_uri }}/{{ workload.structures_prefix }}"
+    next:
+      arcs:
+        - step: cleanup_local_raw
+
+  - step: cleanup_local_raw
+    desc: Remove generated raw artifacts from the Git worktree after upload
+    spec:
+      policy:
+        admit:
+          rules:
+            - when: "{{ ctx.cleanup_local_raw == 'true' }}"
+              then: { allow: true }
+            - else:
+                then: { allow: false }
+    tool:
+      kind: shell
+      cmds:
+        - |
+          set -euo pipefail
+          cd "{{ workload.project_repo }}"
+          rm -f data/structures/manifest.json
+          rm -f data/structures/metadata_index.json
+          rm -rf data/structures/raw/GLUT1 data/structures/raw/GLUT2 \
+                 data/structures/raw/GLUT3 data/structures/raw/GLUT4 \
+                 data/structures/raw/GLUT5 data/structures/raw/GLUT9
+    next:
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Structure registry processing complete
+    tool:
+      kind: noop
