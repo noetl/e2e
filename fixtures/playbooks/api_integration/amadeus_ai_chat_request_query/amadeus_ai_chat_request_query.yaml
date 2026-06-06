@@ -17,7 +17,7 @@ workload:
 
 keychain:
   - name: openai_token
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
@@ -25,7 +25,7 @@ keychain:
       api_key: "{{ openai_secret_path }}"
 
   - name: amadeus_credentials
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
