@@ -60,7 +60,7 @@ workflow:
       message: '{{ ctx.message }}'
       timeout: '{{ ctx.config.timeout }}'
       full_greeting: '{{ greeting }}, {{ ctx.message }}'
-    code: "# This step receives data using {{ ctx.* }} templates\nresult = {\n   \
+    code: "# This step receives data using ctx.* templates\nresult = {\n   \
       \ \"status\": \"success\",\n    \"received_counter\": counter,\n    \"received_message\"\
       : message,\n    \"received_timeout\": timeout,\n    \"full_greeting\": full_greeting\n\
       }\n"
