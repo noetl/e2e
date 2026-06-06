@@ -79,11 +79,9 @@ workflow:
       mode: exclusive
     arcs:
     - step: helper
-      when: '{{ aggregate.count > 0 }}'
       set:
         ctx.helper_message: Aggregate completed with {{ aggregate.count }} items
         ctx.helper_data: '{{ aggregate }}'
-    - step: test_secrets
 - step: helper
   desc: Helper step to demonstrate call action
   tool:
@@ -103,17 +101,6 @@ workflow:
       result = {"helper_called": True, "message": message}
 
       '
-  next:
-    spec:
-      mode: exclusive
-    arcs:
-    - step: verify
-- step: test_secrets
-  desc: Fetch secret from environment
-  tool:
-  - name: TEST_SECRET
-    kind: secrets
-    provider: env
   next:
     spec:
       mode: exclusive
