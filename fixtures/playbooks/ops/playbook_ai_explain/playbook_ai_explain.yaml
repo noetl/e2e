@@ -20,7 +20,7 @@ workload:
 
 keychain:
   - name: openai_token
-    kind: secret_manager
+    kind: secrets
     provider: gcp
     scope: global
     auth: "{{ gcp_auth }}"
