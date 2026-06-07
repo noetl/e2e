@@ -1,0 +1,97 @@
+# Container Tool Callback — OOMKilled kind-val fixture.
+#
+# Round 5 of the Container Tool Callback umbrella
+# (noetl/ai-meta#43).  Exercises the failure path:
+#
+#   1. Worker creates a K8s Job via `Tool::Container` with a
+#      deliberately undersized memory limit (32Mi) and a
+#      workload that immediately exceeds it.
+#   2. Pod is OOMKilled by the kubelet.
+#   3. noetl-k8s-watcher classifies the Pod's
+#      `state.terminated.reason == "OOMKilled"` to the
+#      `failed_oom` `TerminalState` variant (umbrella's
+#      failure-mode taxonomy) and POSTs to the server's
+#      container-callback endpoint.
+#   4. noetl-server's handler:
+#      - emits `call.done` with `status=FAILED` +
+#        `meta.terminal_state=failed_oom` (matches a live
+#        execution), OR
+#      - bumps `noetl_container_callback_stale_total{state="failed_oom"}`
+#        (transition state).
+#
+# Allocation strategy: a single Python `bytes(40 * 1024 * 1024)`
+# (40 MiB) inside an `alpine` + `python3` container.  The 32Mi
+# limit means the kubelet OOM-kills the pod before the
+# allocation completes.  We pick alpine + python3 because it's a
+# small public image (~70MiB pulled) and Python's `bytes()`
+# allocation is guaranteed to actually touch physical pages
+# (defeats lazy-allocation optimisations the kernel might apply
+# to `dd if=/dev/zero`).
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: container_callback_oom
+  path: fixtures/playbooks/container_callback_oom
+  description: |
+    Round 5 kind-val: dispatch a container Job that OOMKills,
+    expect failed_oom terminal state classified by the watcher.
+
+workload: {}
+
+workflow:
+  - step: start
+    desc: "Initialise the run"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "initialized"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: dispatch_oom_container
+
+  - step: dispatch_oom_container
+    desc: "Dispatch a container Job that will OOM-kill itself"
+    tool:
+      kind: container
+      image: python:3.12-alpine
+      command: ["python3", "-c"]
+      args:
+        # 40 MiB > 32Mi limit → OOMKilled.  Hold the buffer in a
+        # global so the JIT doesn't free it before the kernel
+        # reaps us.
+        - |
+          import sys
+          sys.stdout.write("CTC_OOM_FIXTURE alloc\n")
+          sys.stdout.flush()
+          BUF = bytes(40 * 1024 * 1024)
+          sys.stdout.write("CTC_OOM_FIXTURE allocated\n")
+          sys.stdout.flush()
+      resources:
+        requests:
+          cpu: "20m"
+          memory: "32Mi"
+        limits:
+          cpu: "200m"
+          # 32Mi limit — alpine + python3 startup uses ~10-15Mi,
+          # so a 40Mi allocation reliably exceeds it.
+          memory: "32Mi"
+      timeout_seconds: 60
+      backoff_limit: 0
+      restart_policy: Never
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Done"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "complete", "fixture": "container_callback_oom"}
