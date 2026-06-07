@@ -1,0 +1,76 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: fanout_reduce_phase6
+  path: tests/fixtures/fanout_reduce_phase6
+
+# Phase D Round 4 kind-val fixture (noetl/ai-meta#49 → noetl/e2e#31).
+#
+# Exercises the orchestrator's fan-in / reduce barrier (server#143 +
+# server#145, v2.49.0 → v2.50.0):
+#
+#     start ──┬─ normalize_customer ─┐
+#             │                      ├─ reduce_customer ─ end
+#             └─ enrich_customer ────┘
+#
+# Two upstream branches fan out from `start` via mode:inclusive +
+# converge on `reduce_customer` via mode:exclusive.  Pre-PR the
+# orchestrator dispatched `reduce_customer` on the FIRST completing
+# upstream — never seeing the other branch's result.  The barrier
+# slice gates dispatch until BOTH upstreams reach a terminal state.
+# The apply_event slice 2 makes the barrier also see Skipped
+# upstreams correctly (not exercised by this fixture, but covered
+# by the unit suite).
+#
+# Acceptance for this fixture, in the kind-val rig:
+#   - Final execution status: COMPLETED.
+#   - Event log contains EXACTLY ONE `step.enter` for
+#     `reduce_customer` (the barrier prevented a second dispatch).
+#   - `reduce_customer.command.completed` arrives AFTER both
+#     branches' `command.completed` events (the orchestrator
+#     waited for both upstreams).
+
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: |
+        def main():
+            return {"status": "ok"}
+    next:
+      spec:
+        mode: inclusive
+      arcs:
+        - step: normalize_customer
+        - step: enrich_customer
+
+  - step: normalize_customer
+    tool:
+      kind: python
+      code: |
+        def main():
+            return {"normalized": True}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: reduce_customer
+
+  - step: enrich_customer
+    tool:
+      kind: python
+      code: |
+        def main():
+            return {"enriched": True}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: reduce_customer
+
+  - step: reduce_customer
+    tool:
+      kind: python
+      code: |
+        def main():
+            return {"reduced": True}
