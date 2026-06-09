@@ -7,7 +7,7 @@ metadata:
 workload:
   test_message: "Testing HTTP tool"
   # Use Kubernetes service DNS so the fixture survives ClusterIP rotation.
-  api_url: "http://noetl.noetl.svc.cluster.local:8082"
+  api_url: "http://noetl-server-rust.noetl.svc.cluster.local:8082"
 
 workflow:
   - step: start

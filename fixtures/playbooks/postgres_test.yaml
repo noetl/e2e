@@ -11,6 +11,7 @@ workflow:
   tool:
   - name: query_catalog
     kind: postgres
+    auth: "pg_noetl_k8s"
     query: SELECT kind, COUNT(*) as count FROM noetl.catalog GROUP BY kind ORDER BY
       count DESC
   next:
