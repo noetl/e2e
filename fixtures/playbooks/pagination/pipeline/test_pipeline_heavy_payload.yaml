@@ -13,7 +13,7 @@ metadata:
 
     - Result externalization to NATS KV/Object Store
 
-    - _prev threading with large data
+    - Forward-only data flow via set:/input:
 
     - Memory-efficient task sequence execution
 
@@ -73,10 +73,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      fetch_result: "{{ output }}"
   - name: process
     kind: python
     input:
-      http_response: '{{ _prev }}'
+      http_response: '{{ fetch_result }}'
       page_num: '{{ ctx.current_page }}'
     code: "import sys\n\nresponse_body = http_response.get('data', {})\nitems = response_body.get('data',\
       \ [])\npaging = response_body.get('paging', {})\nmeta = response_body.get('meta',\
@@ -97,10 +99,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      process_result: "{{ output }}"
   - name: summarize
     kind: python
     input:
-      processed: '{{ _prev }}'
+      processed: '{{ process_result }}'
     code: "result = {\n    'page': processed['page'],\n    'items_processed': processed['items_count'],\n\
       \    'payload_kb': processed['total_payload_kb'],\n    'has_more': processed['has_more'],\n\
       \    'status': 'processed'\n}\n"
@@ -160,7 +164,7 @@ workflow:
       \    \"config\": {\n      \"payload_kb_per_item\": int(payload_kb_per_item),\n\
       \      \"page_size\": int(page_size)\n    }\n  },\n  \"features_tested\": [\n\
       \    \"Heavy HTTP responses with configurable payload\",\n    \"Result externalization\
-      \ via output_select\",\n    \"_prev threading with large data\",\n    \"spec.policy.rules\
+      \ via output_select\",\n    \"Forward-only data flow via set:/input:\",\n    \"spec.policy.rules\
       \ flow control\",\n    \"Memory-efficient data processing\"\n  ]\n}\n"
   next:
     spec:

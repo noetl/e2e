@@ -10,7 +10,7 @@ metadata:
     Uses labeled tasks in tool: pipeline with tool.spec.policy.rules: for per-task
     flow control:
 
-    - _prev threads data between tasks (like Clojure''s ->)
+    - set:/input: threads data between tasks (forward-only)
 
     - tool.spec.policy.rules: provides per-task error handling
 
@@ -95,10 +95,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      fetch_result: "{{ output }}"
   - name: transform
     kind: python
     input:
-      http_response: '{{ _prev }}'
+      http_response: '{{ fetch_result }}'
       page_num: '{{ ctx.current_page }}'
       execution_id: '{{ execution_id }}'
     code: "import json\nfrom datetime import datetime\n\nresponse_body = http_response.get('data',\
@@ -119,10 +121,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      transform_result: "{{ output }}"
   - name: store
     kind: python
     input:
-      data: '{{ _prev }}'
+      data: '{{ transform_result }}'
       db_host: '{{ db_host }}'
       db_port: '{{ db_port }}'
       db_name: '{{ db_name }}'
@@ -213,7 +217,7 @@ workflow:
       \    \"pages_processed\": total_pages,\n    \"id_range\": f\"{min_id} - {max_id}\"\
       ,\n    \"avg_score\": round(float(avg_score), 2) if avg_score else 0\n  },\n\
       \  \"features_tested\": [\n    \"Labeled tasks in tool: pipeline\",\n    \"\
-      tool.spec.policy.rules: per-task flow control\",\n    \"_prev data threading\
+      tool.spec.policy.rules: per-task flow control\",\n    \"set:/input: forward-only data flow\
       \ between tasks\",\n    \"output object for result/error inspection\",\n  \
       \  \"Retry with exponential backoff\",\n    \"Control actions: continue, retry,\
       \ fail\"\n  ]\n}\n\nif not success:\n    result[\"error\"] = f\"Expected {expected_items}\

@@ -81,14 +81,16 @@ workflow:
             out[f'title_{i}'] = str(p.get('title', '')).replace("'", "''")[:80]
             out[f'body_{i}'] = str(p.get('body', '')).replace("'", "''")[:120]
         result = out
+      set:
+        extracted: "{{ output }}"
     - name: insert_posts
       kind: postgres
       auth: "{{ pg_auth }}"
       command: |
         INSERT INTO public.http_to_postgres_simple (id, user_id, title, body) VALUES
-          ({{ _prev.id_0 }}, {{ _prev.uid_0 }}, '{{ _prev.title_0 }}', '{{ _prev.body_0 }}'),
-          ({{ _prev.id_1 }}, {{ _prev.uid_1 }}, '{{ _prev.title_1 }}', '{{ _prev.body_1 }}'),
-          ({{ _prev.id_2 }}, {{ _prev.uid_2 }}, '{{ _prev.title_2 }}', '{{ _prev.body_2 }}')
+          ({{ extracted.id_0 }}, {{ extracted.uid_0 }}, '{{ extracted.title_0 }}', '{{ extracted.body_0 }}'),
+          ({{ extracted.id_1 }}, {{ extracted.uid_1 }}, '{{ extracted.title_1 }}', '{{ extracted.body_1 }}'),
+          ({{ extracted.id_2 }}, {{ extracted.uid_2 }}, '{{ extracted.title_2 }}', '{{ extracted.body_2 }}')
         ON CONFLICT (id) DO NOTHING;
     next:
       spec:

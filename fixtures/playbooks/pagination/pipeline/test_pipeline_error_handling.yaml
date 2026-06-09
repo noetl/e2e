@@ -70,10 +70,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      fetch_flaky_result: "{{ output }}"
   - name: validate
     kind: python
     input:
-      http_response: '{{ _prev }}'
+      http_response: '{{ fetch_flaky_result }}'
     code: "response_body = http_response.get('data', {})\ndata = response_body.get('data',\
       \ [])\nresult = {\n  'test': 'retry_on_500',\n  'status': 'passed' if len(data)\
       \ > 0 else 'failed',\n  'items_received': len(data),\n  'message': 'Retry succeeded\
@@ -136,10 +138,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      fetch_2_result: "{{ output }}"
   - name: validate
     kind: python
     input:
-      http_response: '{{ _prev }}'
+      http_response: '{{ fetch_2_result }}'
     code: "response_body = http_response.get('data', {})\ndata = response_body.get('data',\
       \ [])\nresult = {\n  'test': 'retry_on_rate_limit',\n  'status': 'passed',\n\
       \  'items_received': len(data),\n  'message': 'Rate limit handled correctly'\n\
@@ -158,10 +162,12 @@ workflow:
     method: GET
     params:
       page: 1
+    set:
+      fetch_result: "{{ output }}"
   - name: transform_bad
     kind: python
     input:
-      http_response: '{{ _prev }}'
+      http_response: '{{ fetch_result }}'
     code: 'broken = http_response[''nonexistent_key''][''also_missing'']
 
       result = broken
@@ -176,10 +182,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      transform_bad_result: "{{ output }}"
   - name: validate
     kind: python
     input:
-      prev_data: '{{ _prev }}'
+      prev_data: '{{ transform_bad_result }}'
     code: "result = {\n  'test': 'skip_transform_error',\n  'status': 'passed',\n\
       \  'skipped': True,\n  'prev_after_skip': prev_data,\n  'message': 'Transform\
       \ error was skipped successfully'\n}\n"
