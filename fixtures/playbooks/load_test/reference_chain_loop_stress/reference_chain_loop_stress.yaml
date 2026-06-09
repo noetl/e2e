@@ -70,10 +70,12 @@ workflow:
               - else:
                   then:
                     do: continue
+        set:
+          fetch_data: "{{ output }}"
       - name: reduce_page
         kind: python
         input:
-          response: "{{ _prev.data }}"
+          response: "{{ fetch_data.data }}"
           current_chain_ok: "{{ ctx.chain_contract_ok }}"
           pages_fetched: "{{ ctx.pages_fetched }}"
         code: |

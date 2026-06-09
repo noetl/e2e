@@ -55,10 +55,12 @@ workflow:
         - else:
             then:
               do: continue
+    set:
+      fetch_result: "{{ output }}"
   - name: collect
     kind: python
     input:
-      http_response: '{{ _prev }}'
+      http_response: '{{ fetch_result }}'
       existing_data: '{{ ctx.collected_data }}'
     code: "response_body = http_response.get('data', {})\nitems = response_body.get('data',\
       \ [])\npaging = response_body.get('paging', {})\n\n# Append new items to existing\

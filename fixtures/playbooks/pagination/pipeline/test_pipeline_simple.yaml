@@ -46,11 +46,13 @@ workflow:
               - else:
                   then:
                     do: continue
+        set:
+          fetch_result: "{{ output }}"
 
       - name: transform
         kind: python
         input:
-          http_response: "{{ _prev }}"
+          http_response: "{{ fetch_result }}"
         code: |
           response_body = http_response.get('data', {})
           items = response_body.get('data', [])
@@ -59,11 +61,13 @@ workflow:
             'ids': [i['id'] for i in items],
             'has_more': response_body.get('paging', {}).get('hasMore', False)
           }
+        set:
+          transform_result: "{{ output }}"
 
       - name: validate
         kind: python
         input:
-          transformed: "{{ _prev }}"
+          transformed: "{{ transform_result }}"
         code: |
           assert transformed['count'] == 5, f"Expected 5 items, got {transformed['count']}"
           assert transformed['ids'] == [1, 2, 3, 4, 5], f"Expected [1,2,3,4,5], got {transformed['ids']}"

@@ -52,12 +52,14 @@ workflow:
       item: '{{ item }}'
     code: "result = {\n    'item_name': item.get('name', 'unknown'),\n    'item_value':\
       \ item.get('value', 0)\n}\n"
+    set:
+      transformed: "{{ output }}"
   - name: save_item
     kind: postgres
     credential: '{{ pg_auth }}'
     query: "INSERT INTO public.iterator_save_test (id, execution_id, item_name, item_value)\n\
-      VALUES (\n  '{{ execution_id }}:{{ _prev.item_name }}',\n  '{{ execution_id\
-      \ }}',\n  '{{ _prev.item_name }}',\n  {{ _prev.item_value }}\n)\nON CONFLICT\
+      VALUES (\n  '{{ execution_id }}:{{ transformed.item_name }}',\n  '{{ execution_id\
+      \ }}',\n  '{{ transformed.item_name }}',\n  {{ transformed.item_value }}\n)\nON CONFLICT\
       \ (id) DO UPDATE SET\n  item_value = EXCLUDED.item_value,\n  created_at = now();\n"
   next:
     spec:

@@ -5,6 +5,7 @@
 # - All knobs live under `spec` at any level
 # - Policies under `spec.policy` typed by scope
 # - Task output via `task.spec.policy.rules` (not eval)
+# - Forward-only data flow via `set:` / `input:` (no `_prev` / `_results`)
 # - Routing via `next.spec` + `next.arcs[]` (Petri-net arcs)
 # - NO `step.when` field (use `step.spec.policy.admit.rules`)
 # - Outcome status uses "ok" | "error" (not "success")
@@ -129,12 +130,13 @@ workflow:
                 then: { do: fail }
               - else:
                   then: { do: continue }
+        set:
+          validate_result: "{{ output }}"
 
       - name: transform
         kind: python
         input:
-          # _prev contains previous task's result
-          prev: "{{ _prev }}"
+          prev: "{{ validate_result }}"
         code: |
           result = {"transformed": True, "items": prev.get("count", 0)}
         spec:
