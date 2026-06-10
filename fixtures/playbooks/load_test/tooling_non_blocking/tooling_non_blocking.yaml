@@ -45,9 +45,6 @@ workload:
       duckdb_work_units: 200000
 
   # Optional probes are disabled by default so the fixture stays runnable in local kind.
-  enable_snowflake_probe: false
-  enable_nats_kv_probe: false
-
   snowflake_auth: "sf_test"
   nats_auth: "nats_credential"
   nats_kv_bucket: "sessions"
