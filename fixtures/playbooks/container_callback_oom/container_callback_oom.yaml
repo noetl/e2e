@@ -19,14 +19,19 @@
 #      - bumps `noetl_container_callback_stale_total{state="failed_oom"}`
 #        (transition state).
 #
-# Allocation strategy: a single Python `bytes(40 * 1024 * 1024)`
-# (40 MiB) inside an `alpine` + `python3` container.  The 32Mi
-# limit means the kubelet OOM-kills the pod before the
-# allocation completes.  We pick alpine + python3 because it's a
-# small public image (~70MiB pulled) and Python's `bytes()`
-# allocation is guaranteed to actually touch physical pages
-# (defeats lazy-allocation optimisations the kernel might apply
-# to `dd if=/dev/zero`).
+# Allocation strategy: a Python `bytearray(64 * 1024 * 1024)`
+# (64 MiB) inside an `alpine` + `python3` container, with one
+# write per 4 KiB page so the kernel actually backs every page
+# with physical RAM.  The 32Mi limit means the kubelet OOM-kills
+# the pod before the loop finishes.  We pick alpine + python3
+# because it's a small public image (~70MiB pulled).
+#
+# A `bytes(n)` allocation is NOT used here: CPython backs it with
+# `calloc`, which the kernel maps to the shared zero page and
+# never faults in until written — so the process never touches
+# physical memory and never trips the cgroup limit.  A mutable
+# `bytearray` that we write into dirties real pages and reliably
+# OOM-kills.
 apiVersion: noetl.io/v2
 kind: Playbook
 
@@ -60,14 +65,17 @@ workflow:
       image: python:3.12-alpine
       command: ["python3", "-c"]
       args:
-        # 40 MiB > 32Mi limit → OOMKilled.  Hold the buffer in a
-        # global so the JIT doesn't free it before the kernel
-        # reaps us.
+        # 64 MiB of dirtied pages > 32Mi limit → OOMKilled.  Use a
+        # mutable bytearray and write one byte per 4 KiB page so the
+        # kernel faults in real physical memory (a calloc-backed
+        # bytes(n) maps to the zero page and never trips the limit).
         - |
           import sys
           sys.stdout.write("CTC_OOM_FIXTURE alloc\n")
           sys.stdout.flush()
-          BUF = bytes(40 * 1024 * 1024)
+          BUF = bytearray(64 * 1024 * 1024)
+          for i in range(0, len(BUF), 4096):
+              BUF[i] = 1
           sys.stdout.write("CTC_OOM_FIXTURE allocated\n")
           sys.stdout.flush()
       resources:
