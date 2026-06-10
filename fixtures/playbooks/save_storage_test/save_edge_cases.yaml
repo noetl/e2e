@@ -127,7 +127,7 @@ workflow:
       records\"].append(record)\n\nresult = large_data\n"
   - name: save_large_payload
     kind: duckdb
-    commands: "-- Create table for large dataset\nCREATE OR REPLACE TABLE test_large_payload\
+    command: "-- Create table for large dataset\nCREATE OR REPLACE TABLE test_large_payload\
       \ (\n  test_type VARCHAR,\n  record_count INTEGER,\n  execution_id VARCHAR,\n\
       \  created_at TIMESTAMP\n);\n\n-- Insert test record\nINSERT INTO test_large_payload\n\
       VALUES ('large_payload_test', {{ generate_large.metadata.record_count }}, '{{\
