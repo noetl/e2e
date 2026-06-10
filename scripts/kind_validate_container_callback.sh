@@ -35,7 +35,7 @@ set -euo pipefail
 
 KIND_CONTEXT="${NOETL_KIND_CONTEXT:-kind-noetl}"
 NAMESPACE="${NOETL_K8S_WATCH_NAMESPACE:-noetl}"
-NOETL_SERVER_DEPLOY="${NOETL_SERVER_DEPLOY:-noetl-server}"
+NOETL_SERVER_DEPLOY="${NOETL_SERVER_DEPLOY:-noetl-server-rust}"
 NOETL_WATCHER_DEPLOY="${NOETL_WATCHER_DEPLOY:-noetl-k8s-watcher}"
 NOETL_SERVER_URL="${NOETL_SERVER_URL:-http://localhost:8082}"
 
@@ -67,11 +67,27 @@ echo "kind-val: fixtures=$FIXTURE_DIR"
 # Preflight — required tooling + cluster + watcher healthy
 # ----------------------------------------------------------------------
 
-for cmd in kubectl noetl curl; do
+for cmd in kubectl noetl curl python3; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "kind-val: required command not in PATH: $cmd" >&2
     exit 2
   }
+done
+
+# CLI-surface guard.  This rig drives the current noetl command
+# surface: `register playbook`, `exec`, `status`.  That surface is
+# stable from CLI v2.17.0 through the v4.x line (the repos/cli
+# submodule).  Older binaries exposed `noetl playbook
+# register/execute` + `noetl execution status`, which were removed —
+# fail fast rather than aborting mid-run on `unrecognized subcommand`.
+for sub in "register playbook" "exec" "status"; do
+  if ! noetl $sub --help >/dev/null 2>&1; then
+    echo "kind-val: this rig needs the current noetl CLI surface" >&2
+    echo "kind-val: missing subcommand: noetl $sub" >&2
+    echo "kind-val: installed CLI: $(noetl --version 2>/dev/null || echo unknown)" >&2
+    echo "kind-val: expected surface — register playbook / exec / status (CLI >= v2.17.0)." >&2
+    exit 2
+  fi
 done
 
 KCTX=(kubectl --context "$KIND_CONTEXT" -n "$NAMESPACE")
@@ -137,7 +153,13 @@ scrape_total_for_state() {
 # ----------------------------------------------------------------------
 
 run_probe() {
-  local label="$1" path="$2" expected_state="$3" timeout="$4"
+  # Args:
+  #   $1 label           human-readable probe name
+  #   $2 path            fixture file path (relative to FIXTURE_DIR) to register
+  #   $3 catalog_path    catalog path (metadata.path) to exec by
+  #   $4 expected_state  callback state to assert the counter moved for
+  #   $5 timeout         seconds to wait for terminal status
+  local label="$1" path="$2" catalog_path="$3" expected_state="$4" timeout="$5"
 
   echo
   echo "================================================================"
@@ -150,13 +172,14 @@ run_probe() {
   before=$(scrape_total_for_state "$expected_state")
   echo "kind-val: counter (state=$expected_state) before = $before"
 
-  # Register + run.  `noetl playbook register` is idempotent;
+  # Register + run.  `noetl register playbook` is idempotent;
   # second registration with the same path replaces the prior
-  # version.
-  noetl playbook register --file "$FIXTURE_DIR/$path"
+  # version.  Exec by the catalog *path* (metadata.path), not the
+  # bare name; `--json` emits {"execution_id": ..., ...}.
+  noetl register playbook --file "$FIXTURE_DIR/$path"
 
   local execution_id
-  execution_id=$(noetl playbook execute --path "$path" --output json \
+  execution_id=$(noetl exec "$catalog_path" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')
   echo "kind-val: launched execution_id=$execution_id"
 
@@ -164,7 +187,7 @@ run_probe() {
   local deadline=$(( SECONDS + timeout ))
   local final_status=""
   while [[ $SECONDS -lt $deadline ]]; do
-    final_status=$(noetl execution status --id "$execution_id" --output json 2>/dev/null \
+    final_status=$(noetl status "$execution_id" --json 2>/dev/null \
       | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))' || true)
     case "$final_status" in
       COMPLETED|FAILED) break ;;
@@ -206,6 +229,7 @@ OVERALL=0
 if ! run_probe \
     "happy_path" \
     "container_callback_happy_path/container_callback_happy_path.yaml" \
+    "fixtures/playbooks/container_callback_happy_path" \
     "succeeded" \
     180; then
   OVERALL=1
@@ -214,6 +238,7 @@ fi
 if ! run_probe \
     "oom" \
     "container_callback_oom/container_callback_oom.yaml" \
+    "fixtures/playbooks/container_callback_oom" \
     "failed_oom" \
     180; then
   OVERALL=1
