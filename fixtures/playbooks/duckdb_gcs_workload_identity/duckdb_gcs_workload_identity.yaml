@@ -39,7 +39,7 @@ workflow:
           tool: hmac
           key: gcs_hmac_local
           scope: gs://{{ gcs_bucket }}
-      commands: |
+      command: |
         INSTALL httpfs;
         LOAD httpfs;
 
@@ -67,7 +67,7 @@ workflow:
           tool: hmac
           key: gcs_hmac_local
           scope: gs://{{ gcs_bucket }}
-      commands: |
+      command: |
         INSTALL httpfs;
         LOAD httpfs;
 

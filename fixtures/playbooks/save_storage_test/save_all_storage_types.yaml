@@ -207,7 +207,7 @@ workflow:
       \ }\n}\n"
   - name: save_analytics
     kind: duckdb
-    commands: "-- Create analytics table\nCREATE OR REPLACE TABLE test_analytics AS\n\
+    command: "-- Create analytics table\nCREATE OR REPLACE TABLE test_analytics AS\n\
       SELECT\n  'duckdb_analytics' as analysis_type,\n  '{{ generate_data.data.analysis_type\
       \ }}' as specific_analysis,\n  COUNT(*) as record_count,\n  '{{ execution_id\
       \ }}' as test_execution,\n  NOW() as analysis_timestamp;\n\n-- Insert analysis\

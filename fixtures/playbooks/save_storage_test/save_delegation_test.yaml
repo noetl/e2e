@@ -87,7 +87,7 @@ workflow:
       \ storage delegation working\"\n}\n"
   - name: save_duckdb
     kind: duckdb
-    commands: 'CREATE OR REPLACE TABLE test_duckdb AS
+    command: 'CREATE OR REPLACE TABLE test_duckdb AS
 
       SELECT ''delegation_test'' as test_type, ''duckdb_working'' as status;
 
