@@ -80,6 +80,23 @@ for cmd in kubectl noetl curl python3; do
   }
 done
 
+# CLI-surface guard.  This rig drives the current noetl command
+# surface: `register playbook`, `exec`, `status`, `query`.  That
+# surface is stable from CLI v2.17.0 through the v4.x line (the
+# repos/cli submodule).  Older binaries exposed `noetl playbook
+# register/execute` + `noetl execution status/events`, which were
+# removed — fail fast with a clear message rather than aborting
+# mid-run on `error: unrecognized subcommand`.
+for sub in "register playbook" "exec" "status" "query"; do
+  if ! noetl $sub --help >/dev/null 2>&1; then
+    echo "kind-val: this rig needs the current noetl CLI surface" >&2
+    echo "kind-val: missing subcommand: noetl $sub" >&2
+    echo "kind-val: installed CLI: $(noetl --version 2>/dev/null || echo unknown)" >&2
+    echo "kind-val: expected surface — register playbook / exec / status / query (CLI >= v2.17.0)." >&2
+    exit 2
+  fi
+done
+
 if [[ ! -f "$FIXTURE_PATH" ]]; then
   echo "kind-val: fixture not found: $FIXTURE_PATH" >&2
   exit 2
@@ -106,9 +123,12 @@ echo "================================================================"
 echo "kind-val: register + execute fanout_reduce_phase6"
 echo "================================================================"
 
-noetl playbook register --file "$FIXTURE_PATH"
+noetl register playbook --file "$FIXTURE_PATH"
 
-EXECUTION_ID="$(noetl playbook execute --path "$PLAYBOOK_PATH" --output json \
+# Exec by the catalog *path* (metadata.path), not the bare name —
+# distributed runtime resolves the path against the catalog.
+# `--json` emits a single JSON object: {"execution_id": ..., ...}.
+EXECUTION_ID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
 echo "kind-val: launched execution_id=$EXECUTION_ID"
 
@@ -119,7 +139,7 @@ echo "kind-val: launched execution_id=$EXECUTION_ID"
 DEADLINE=$(( SECONDS + TIMEOUT_SECS ))
 FINAL_STATUS=""
 while [[ $SECONDS -lt $DEADLINE ]]; do
-  FINAL_STATUS="$(noetl execution status --id "$EXECUTION_ID" --output json 2>/dev/null \
+  FINAL_STATUS="$(noetl status "$EXECUTION_ID" --json 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))' || true)"
   case "$FINAL_STATUS" in
     COMPLETED|FAILED) break ;;
@@ -132,7 +152,13 @@ echo "kind-val: execution_id=$EXECUTION_ID final_status=$FINAL_STATUS"
 # Pull the event log + run barrier assertions.
 # ----------------------------------------------------------------------
 
-EVENTS_JSON="$(noetl execution events --id "$EXECUTION_ID" --output json 2>/dev/null || echo '[]')"
+# No CLI `events` verb today — pull the event log over the Postgres
+# query API.  `noetl query` wraps the rows under `.result`; order by
+# `event_id` (monotonic, commit-ordered) since `noetl.event` has no
+# `timestamp` column.  The assertions below unwrap `.result`.
+EVENTS_JSON="$(noetl query \
+  "SELECT event_id, event_type, node_name, event_time FROM noetl.event WHERE execution_id = $EXECUTION_ID ORDER BY event_id" \
+  --format json 2>/dev/null || echo '{"result": []}')"
 
 OVERALL=0
 fail() {
@@ -148,7 +174,7 @@ fi
 # Assertion 2: exactly one step.enter for reduce_customer.
 REDUCE_ENTERS="$(printf '%s' "$EVENTS_JSON" | python3 -c '
 import json, sys
-events = json.loads(sys.stdin.read() or "[]")
+events = json.loads(sys.stdin.read() or "{}").get("result", [])
 count = sum(1 for e in events
             if e.get("event_type") == "step.enter"
             and e.get("node_name") == "reduce_customer")
@@ -159,14 +185,15 @@ if [[ "$REDUCE_ENTERS" != "1" ]]; then
 fi
 
 # Assertion 3: reduce_customer.command.completed AFTER both branches'
-# command.completed.  Compares ISO timestamps; reduce's timestamp
-# must be strictly greater than the MAX of the branches'.
+# command.completed.  Compares `event_id` (monotonic, commit-ordered);
+# reduce's last completion id must be strictly greater than the MAX of
+# the branches'.
 ORDER_OK="$(printf '%s' "$EVENTS_JSON" | python3 -c '
 import json, sys
-events = json.loads(sys.stdin.read() or "[]")
+events = json.loads(sys.stdin.read() or "{}").get("result", [])
 
 def latest_completion(name):
-    ts = [e.get("created_at") for e in events
+    ts = [e.get("event_id") for e in events
           if e.get("event_type") == "command.completed"
           and e.get("node_name") == name]
     return max(ts) if ts else None
