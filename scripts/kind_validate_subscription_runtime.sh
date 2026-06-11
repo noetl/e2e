@@ -129,9 +129,9 @@ echo "kind-val: creating NATS stream $STREAM + consumer $CONSUMER"
 "${NATS_CLI[@]}" stream rm "$STREAM" -f >/dev/null 2>&1 || true
 "${NATS_CLI[@]}" stream add "$STREAM" --subjects "iot.sensors.>" \
   --storage file --retention limits --discard old --max-msgs=-1 --max-bytes=-1 \
-  --max-age=1h --dupe-window=2m --replicas 1 --no-allow-rollup --deny-delete --deny-purge=false >/dev/null
+  --max-age=1h --dupe-window=2m --replicas 1 --defaults >/dev/null
 "${NATS_CLI[@]}" consumer add "$STREAM" "$CONSUMER" --pull --deliver all --ack explicit \
-  --max-deliver=-1 --wait=5s --replay instant --filter "$SUBJECT" >/dev/null
+  --max-deliver=-1 --wait=5s --replay instant --filter "$SUBJECT" --defaults >/dev/null
 
 # ----------------------------------------------------------------------
 # Deploy the dedicated execution pool + the continuous runtime.
@@ -174,11 +174,19 @@ done
 # ----------------------------------------------------------------------
 # Wait for N child executions to COMPLETE, then assert.
 # ----------------------------------------------------------------------
+# Child executions are linked via playbook_started.parent_execution_id; their
+# TERMINAL events (playbook.completed, emitted by the orchestrator) do NOT carry
+# parent_execution_id, so completion is counted by joining on the child
+# execution_ids.  The dedicated-pool routing is asserted on the playbook_started
+# meta.execution_pool (the per-execution segment), which every command of the run
+# then publishes to (noetl.commands.subscription.<eid>) — the subscription pool
+# worker draining them to COMPLETED is the end-to-end proof.
+KIDS_SQL="SELECT DISTINCT execution_id FROM noetl.event WHERE parent_execution_id=$SUB_ID AND event_type='playbook_started'"
 echo "kind-val: waiting for $COUNT child executions to complete"
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
 completed=0
 while (( $(date +%s) < deadline )); do
-  completed="$(psql_q "SELECT count(DISTINCT e.execution_id) FROM noetl.event e WHERE e.parent_execution_id=$SUB_ID AND e.event_type='playbook.completed'" | tr -d '[:space:]')"
+  completed="$(psql_q "SELECT count(DISTINCT execution_id) FROM noetl.event WHERE execution_id IN ($KIDS_SQL) AND event_type='playbook.completed'" | tr -d '[:space:]')"
   [[ "$completed" -ge "$COUNT" ]] && break
   sleep 4
 done
@@ -187,17 +195,20 @@ children="$(psql_q "SELECT count(DISTINCT execution_id) FROM noetl.event WHERE p
 redirected="$(psql_q "SELECT count(DISTINCT execution_id) FROM noetl.event WHERE parent_execution_id=$SUB_ID AND event_type='playbook_started' AND node_name='$PRIORITY_PB'" | tr -d '[:space:]')"
 defaulted="$(psql_q "SELECT count(DISTINCT execution_id) FROM noetl.event WHERE parent_execution_id=$SUB_ID AND event_type='playbook_started' AND node_name='$DEFAULT_PB'" | tr -d '[:space:]')"
 traced="$(psql_q "SELECT count(DISTINCT execution_id) FROM noetl.event WHERE parent_execution_id=$SUB_ID AND event_type='playbook_started' AND meta->'trace'->>'traceparent'='$TRACEPARENT'" | tr -d '[:space:]')"
-pooled="$(psql_q "SELECT count(*) FROM noetl.event e WHERE e.parent_execution_id=$SUB_ID AND e.event_type='command.issued' AND e.meta->>'execution_pool'='subscription'" | tr -d '[:space:]')"
+pooled="$(psql_q "SELECT count(DISTINCT execution_id) FROM noetl.event WHERE parent_execution_id=$SUB_ID AND event_type='playbook_started' AND meta->>'execution_pool'='subscription'" | tr -d '[:space:]')"
+directives="$(psql_q "SELECT count(*) FROM noetl.event WHERE execution_id IN ($KIDS_SQL) AND event_type='subscription.message.directives_applied'" | tr -d '[:space:]')"
 
-echo "kind-val: children=$children completed=$completed redirected=$redirected defaulted=$defaulted traced=$traced"
+echo "kind-val: children=$children completed=$completed redirected=$redirected defaulted=$defaulted traced=$traced pooled=$pooled directives=$directives"
 
 FAIL=0
 assert() { if [[ "$2" -ge "$3" ]]; then echo "  PASS: $1 ($2 >= $3)"; else echo "  FAIL: $1 ($2 < $3)"; FAIL=1; fi; }
 assert "one child execution per message"            "$children"    "$COUNT"
 assert "all children reached COMPLETED"             "$completed"   "$COUNT"
+assert "children dispatched on subscription pool"   "$pooled"      "$COUNT"
 assert "redirect directive routed to priority pb"   "$redirected"  "$REDIRECT"
 assert "default messages ran the default pb"        "$defaulted"   "$(( COUNT - REDIRECT ))"
 assert "W3C traceparent propagated into children"   "$traced"      "$COUNT"
+assert "directives_applied audit events emitted"    "$directives"  "$REDIRECT"
 
 # ----------------------------------------------------------------------
 # Lifecycle: pause → resume, asserting the event trail.
@@ -207,9 +218,18 @@ curl -fsS -X POST "$SERVER_URL/api/subscriptions/$SUB_ID/pause"  >/dev/null
 sleep 2
 curl -fsS -X POST "$SERVER_URL/api/subscriptions/$SUB_ID/resume" >/dev/null
 sleep 2
-life="$(psql_q "SELECT string_agg(event_type, ',' ORDER BY event_id) FROM noetl.event WHERE execution_id=$SUB_ID AND event_type LIKE 'subscription.%'")"
+# Drain + deactivate fire when the runtime shuts down.  Kubernetes sends
+# SIGTERM, so scale the runtime to 0 and assert the runtime drained +
+# deactivated on the way out (proves SIGTERM-driven graceful shutdown).
+echo "kind-val: scaling runtime to 0 (SIGTERM) to test drain/deactivate-on-shutdown"
+"${KCTX[@]}" -n "$NS" scale deploy/noetl-subscription-runtime --replicas=0 >/dev/null
+for _ in $(seq 1 20); do
+  life="$(psql_q "SELECT string_agg(event_type, ',' ORDER BY event_id) FROM noetl.event WHERE execution_id=$SUB_ID AND event_type LIKE 'subscription.%'")"
+  [[ "$life" == *"subscription.deactivated"* ]] && break
+  sleep 3
+done
 echo "kind-val: lifecycle trail: $life"
-for ev in subscription.registered subscription.activated subscription.paused subscription.resumed; do
+for ev in subscription.registered subscription.activated subscription.paused subscription.resumed subscription.draining subscription.deactivated; do
   if [[ "$life" == *"$ev"* ]]; then echo "  PASS: lifecycle has $ev"; else echo "  FAIL: lifecycle missing $ev"; FAIL=1; fi
 done
 
