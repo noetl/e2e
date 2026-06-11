@@ -69,7 +69,13 @@ workflow:
         response: "{{ fetch_page }}"
         collected: "{{ ctx.collected_events }}"
       code: |
-        data = response.get('data', {})
+        # The Rust http tool nests the parsed JSON payload under `body`
+        # ({{ fetch_page }} -> {body, headers, status_code}); the page
+        # fields live at response.body.* (response.data.* is absent).
+        # NOTE: terminal-page collection is blocked by noetl/ai-meta#89 —
+        # the worker serializes the final `next_cursor: null` as JS
+        # `undefined`, so `response` arrives here as an unparseable str.
+        data = response.get('body', {})
         events = data.get('events', [])
         next_cursor = data.get('next_cursor', '')
 

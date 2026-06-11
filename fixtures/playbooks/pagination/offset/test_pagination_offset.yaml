@@ -71,7 +71,10 @@ workflow:
         current_offset: "{{ ctx.offset }}"
         limit: "{{ ctx.limit }}"
       code: |
-        data = response.get('data', {})
+        # The Rust http tool nests the parsed JSON payload under `body`
+        # ({{ fetch_page }} -> {body, headers, status_code}); the page
+        # fields live at response.body.* (response.data.* is absent).
+        data = response.get('body', {})
         users = data.get('users', [])
         has_more = data.get('has_more', False)
 
