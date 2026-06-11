@@ -1,0 +1,69 @@
+# kind: Subscription — continuous NATS listener (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 2 — live validation of the continuous
+# subscription runtime (Mode B) + the header-directive engine.
+#
+# The runtime (WORKER_MODE=subscription) activates this subscription,
+# holds the NATS source open, and turns EACH received message into one
+# POST /api/execute on the dedicated `subscription` pool segment.  A
+# header `x-noetl-route` redirects to a different target playbook
+# (allowlist-constrained); `traceparent` rides into the child
+# execution's event meta.trace.
+#
+# Driven by scripts/kind_validate_subscription_runtime.sh, which
+# pre-creates the NATS stream + durable consumer, deploys the runtime +
+# dedicated pool, publishes N messages, and asserts one COMPLETED child
+# execution per message on the subscription pool, the redirect + trace
+# cases, and the lifecycle event trail.
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: iot_sensor_stream
+  path: subscriptions/iot_sensor_stream
+  description: |
+    Continuous NATS subscription that dispatches one execution per
+    sensor reading on the dedicated subscription pool.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  # NATS source credential (type nats) — resolved from the server, never
+  # a pod env var (no-default-connection.md + execution-model.md).
+  auth: nats_e2e
+  stream: IOT_SENSORS
+  consumer: iot-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    batch: 50
+    timeout_ms: 2000
+
+  dispatch:
+    # Default per-message playbook.
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    # Isolate the firehose on the dedicated command segment.
+    execution_pool: subscription
+
+  headers:
+    normalize: true
+    directives:
+      # Header-driven redirect — only these two targets are allowed.
+      - header: x-noetl-route
+        controls: dispatch.playbook
+        allowed:
+          - tests/fixtures/sub_ingest_default
+          - tests/fixtures/sub_ingest_priority
+      # Idempotency key feeds the dedup window + spool key (Phase 4).
+      - header: x-idempotency-key
+        controls: idempotency_key
+      # Content-type parse hint.
+      - header: content-type
+        controls: content_type
+    trace:
+      propagate: w3c
+      baggage_allowlist: ["tenant"]
+    passthrough: data
