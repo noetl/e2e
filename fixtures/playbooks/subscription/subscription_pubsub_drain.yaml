@@ -1,0 +1,126 @@
+# Bounded subscription drain — Google Pub/Sub backend (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 1 — live validation of the `subscription` tool's
+# Pub/Sub pull backend against the in-cluster Pub/Sub emulator
+# (ops ci/manifests/pubsub-emulator/).  Mirror of the NATS
+# examples/subscription_drain.yaml, with source: pubsub.
+#
+# Driven by scripts/kind_validate_subscription_pubsub.sh, which creates the
+# topic + subscription on the emulator, publishes N messages, then triggers
+# this playbook and asserts the bounded drain returned N, acked them, the
+# execution reached COMPLETED, and the event trail landed.
+#
+# Per agents/rules/no-default-connection.md the Pub/Sub connection is named
+# explicitly via `auth:`.  The `pubsub_e2e` credential alias (type `pubsub`)
+# carries the emulator endpoint, which the worker's credential-alias
+# resolver merges into the tool config; the Pub/Sub backend treats the
+# plaintext http endpoint as an emulator and skips auth.
+
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: subscription_pubsub_drain
+  path: tests/fixtures/subscription_pubsub_drain
+  description: |
+    Bounded Google Pub/Sub subscription drain — pull up to `batch`
+    messages from the emulator subscription, ack them, and fan out over
+    the batch.  Phase 1 live-validation fixture for the subscription tool
+    (noetl/ai-meta#90).
+
+workload:
+  # Pub/Sub credential alias (type `pubsub`).  Resolved at dispatch time;
+  # carries {"endpoint": "pubsub-emulator.pubsub.svc.cluster.local:8085"}.
+  pubsub_auth: pubsub_e2e
+
+  # Full subscription resource the emulator hosts.  The runner creates
+  # this topic + subscription before triggering.
+  subscription: "projects/noetl-e2e/subscriptions/noetl-e2e-pubsub-sub"
+
+  # Bounded-drain knobs (tool caps batch at 1000, timeout_ms at 5000).
+  batch: 50
+  timeout_ms: 4000
+
+workflow:
+  - step: start
+    desc: "Pub/Sub subscription drain invocation entry"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "started"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: drain
+
+  - step: drain
+    desc: "Bounded drain of the Pub/Sub subscription via the subscription tool"
+    tool:
+      kind: subscription
+      source: pubsub
+      operation: poll
+      auth: "{{ pubsub_auth }}"
+      subscription: "{{ subscription }}"
+      batch: "{{ batch }}"
+      timeout_ms: "{{ timeout_ms }}"
+      ack: on_success
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: process_batch
+          when: "{{ drain.count > 0 }}"
+        - step: empty
+          when: "{{ drain.count == 0 }}"
+
+  - step: process_batch
+    desc: "Fan out over each drained message"
+    tool:
+      kind: python
+      input:
+        message: "{{ item.data }}"
+        message_id: "{{ item.id }}"
+      code: |
+        result = {
+            "processed_id": input_data.get("message_id"),
+            "payload": input_data.get("message"),
+        }
+      iterator:
+        items: "{{ drain.messages }}"
+        item: message
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: empty
+    desc: "Nothing to drain this invocation"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "empty", "drained": 0}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Pub/Sub drain iteration complete"
+    tool:
+      kind: python
+      input:
+        drained: "{{ drain.count | default(0) }}"
+        acked: "{{ drain.acked | default(false) }}"
+        source: "{{ drain.source | default('pubsub') }}"
+      code: |
+        result = {
+            "status": "complete",
+            "drained": input_data.get("drained", 0),
+            "acked": input_data.get("acked", False),
+            "source": input_data.get("source"),
+        }

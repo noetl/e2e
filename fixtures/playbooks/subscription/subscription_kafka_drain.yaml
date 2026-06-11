@@ -1,0 +1,128 @@
+# Bounded subscription drain — Apache Kafka backend (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 1 — live validation of the `subscription` tool's
+# Kafka poll backend against the in-cluster single-broker KRaft Kafka
+# (ops ci/manifests/kafka/).  Mirror of the NATS
+# examples/subscription_drain.yaml, with source: kafka.
+#
+# Driven by scripts/kind_validate_subscription_kafka.sh, which creates the
+# topic, produces N messages, then triggers this playbook and asserts the
+# bounded drain returned N, committed offsets, the execution reached
+# COMPLETED, and the event trail landed.
+#
+# Per agents/rules/no-default-connection.md the Kafka connection is named
+# explicitly via `auth:`.  The `kafka_e2e` credential alias (type `kafka`)
+# carries the broker list, which the worker's credential-alias resolver
+# merges into the tool config.  Phase 1 Kafka is plaintext-only and does
+# not surface record headers (documented in source/kafka.rs).
+
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: subscription_kafka_drain
+  path: tests/fixtures/subscription_kafka_drain
+  description: |
+    Bounded Apache Kafka subscription drain — consumer-group poll up to
+    `batch` messages, commit offsets, and fan out over the batch.  Phase 1
+    live-validation fixture for the subscription tool (noetl/ai-meta#90).
+
+workload:
+  # Kafka credential alias (type `kafka`).  Resolved at dispatch time;
+  # carries {"brokers": "kafka.kafka.svc.cluster.local:9092"}.
+  kafka_auth: kafka_e2e
+
+  # Topic the runner creates + produces to, and the consumer group the
+  # bounded drain commits offsets under.
+  topic: noetl.e2e.kafka.orders
+  group: noetl-e2e-kafka-drain
+
+  # Bounded-drain knobs (tool caps batch at 1000, timeout_ms at 5000).
+  # batch is a soft cap for Kafka (one fetch round may return a full set).
+  batch: 50
+  timeout_ms: 4000
+
+workflow:
+  - step: start
+    desc: "Kafka subscription drain invocation entry"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "started"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: drain
+
+  - step: drain
+    desc: "Bounded consumer-group poll of the Kafka topic via the subscription tool"
+    tool:
+      kind: subscription
+      source: kafka
+      operation: poll
+      auth: "{{ kafka_auth }}"
+      topic: "{{ topic }}"
+      group: "{{ group }}"
+      batch: "{{ batch }}"
+      timeout_ms: "{{ timeout_ms }}"
+      ack: on_success
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: process_batch
+          when: "{{ drain.count > 0 }}"
+        - step: empty
+          when: "{{ drain.count == 0 }}"
+
+  - step: process_batch
+    desc: "Fan out over each drained message"
+    tool:
+      kind: python
+      input:
+        message: "{{ item.data }}"
+        message_id: "{{ item.id }}"
+      code: |
+        result = {
+            "processed_id": input_data.get("message_id"),
+            "payload": input_data.get("message"),
+        }
+      iterator:
+        items: "{{ drain.messages }}"
+        item: message
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: empty
+    desc: "Nothing to drain this invocation"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "empty", "drained": 0}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Kafka drain iteration complete"
+    tool:
+      kind: python
+      input:
+        drained: "{{ drain.count | default(0) }}"
+        acked: "{{ drain.acked | default(false) }}"
+        source: "{{ drain.source | default('kafka') }}"
+      code: |
+        result = {
+            "status": "complete",
+            "drained": input_data.get("drained", 0),
+            "acked": input_data.get("acked", False),
+            "source": input_data.get("source"),
+        }
