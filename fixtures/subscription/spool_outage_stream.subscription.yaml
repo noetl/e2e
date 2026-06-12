@@ -1,0 +1,96 @@
+# kind: Subscription — continuous NATS listener WITH store-and-forward spool
+#
+# noetl/ai-meta#90 Phase 4 — live validation of the store-and-forward spool
+# + per-downstream circuit breaker (RFC §8).
+#
+# The runtime (WORKER_MODE=subscription) activates this subscription, holds
+# the NATS source open, and turns each received message into one
+# POST /api/execute on the dedicated `subscription` pool segment — UNLESS the
+# declared downstream's circuit is open, in which case the message is durably
+# buffered to the `nats_object` spool and acked (buffer_and_ack — no loss),
+# then replayed in order on recovery.
+#
+# Driven by scripts/kind_validate_subscription_spool.sh, which:
+#   1. activates this subscription,
+#   2. scales the `spool-downstream-echo` service to 0 (the circuit's http
+#      probe target → unreachable),
+#   3. publishes N messages during the outage → they spool, event-logged,
+#   4. scales the downstream back up → circuit closes → spool drains and
+#      replays in order with idempotency holding,
+#   5. asserts the full event trail + no data loss.
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: spool_outage_stream
+  path: subscriptions/spool_outage_stream
+  description: |
+    Continuous NATS subscription that buffers to a durable spool when its
+    declared downstream is unavailable, and replays in order on recovery.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  # NATS SOURCE credential (type nats) — resolved from the server, never a
+  # pod env var (no-default-connection.md + execution-model.md).
+  auth: nats_e2e
+  stream: SPOOL_OUTAGE
+  consumer: spool-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    batch: 50
+    timeout_ms: 2000
+
+  dispatch:
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    execution_pool: subscription
+
+  headers:
+    normalize: true
+    directives:
+      # Idempotency key feeds the dedup window + spool dedup key (RFC §7.2).
+      - header: x-idempotency-key
+        controls: idempotency_key
+    trace:
+      propagate: w3c
+    passthrough: data
+
+  # Store-and-forward spool (RFC §8, Phase 4).
+  spool:
+    # buffer_and_ack: write to the durable backend, then ack. The push
+    # default; loss-safe across arbitrary outages.
+    mode: buffer_and_ack
+    # nats_object: reuse the NATS Object Store the cluster already runs — no
+    # external bucket credential needed for the in-cluster proof.
+    backend: nats_object
+    bucket: noetl_spool_outage
+    # Per-key lanes keyed on device_id so independent devices drain
+    # concurrently while order holds within a device.
+    ordering: per_key
+    ordering_key: device_id
+    circuit:
+      # Trip fast for the test (default is 5).
+      trip_after: 2
+      # Half-open the dispatch probe window after 3s.
+      probe_after_ms: 3000
+      # Active-probe the downstream every 2s.
+      probe_interval_ms: 2000
+      downstream:
+        # The toggleable in-cluster service. Scaling its Deployment to 0
+        # makes this http probe fail → the circuit opens → messages spool.
+        - name: warehouse
+          type: http
+          target: "http://spool-downstream-echo.noetl.svc.cluster.local:5678/"
+    retention:
+      # The cost ceiling (OQ3) — generous for the test; on_full drops oldest
+      # to the dead-letter lane rather than losing the newest.
+      max_bytes: 67108864
+      on_full: drop_to_dlq
+    drain:
+      max_replay_attempts: 3
+      # Drain the backlog fully before resuming live — preserves order.
+      on_recovery: ordered_then_live
