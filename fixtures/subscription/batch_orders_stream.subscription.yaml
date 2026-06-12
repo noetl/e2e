@@ -1,0 +1,51 @@
+# kind: Subscription — batch-dispatch NATS listener (Phase 7 E2E fixture)
+#
+# noetl/ai-meta#90 Phase 7 — live validation of batch dispatch (RFC §10
+# OQ12).  The continuous runtime drains a backlog and dispatches it via
+# `POST /api/execute/batch` (one HTTP round-trip for the whole batch)
+# instead of one request per message.  Each batch item still carries its
+# own directive-resolved playbook / pool / trace, so per-message
+# traceability is intact — a batch is N independent executions, not one.
+#
+# Driven by scripts/kind_validate_subscription_scale.sh (test: batch).
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: batch_orders_stream
+  path: subscriptions/batch_orders_stream
+  description: |
+    Continuous NATS subscription that BATCH-dispatches drained messages
+    to the dedicated subscription pool — N messages, one /api/execute/batch
+    call, N child executions.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  auth: nats_e2e
+  stream: BATCH_ORDERS
+  consumer: batch-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    # Fetch the whole backlog in one poll so it dispatches as one batch.
+    batch: 100
+    timeout_ms: 2000
+
+  dispatch:
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    execution_pool: subscription
+    # Phase 7 — batch dispatch (RFC §10 OQ12).
+    batch_dispatch: true
+    batch_max: 100
+
+  headers:
+    normalize: true
+    directives:
+      - header: x-idempotency-key
+        controls: idempotency_key
+    trace:
+      propagate: w3c

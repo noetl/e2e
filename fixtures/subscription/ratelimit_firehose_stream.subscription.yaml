@@ -1,0 +1,46 @@
+# kind: Subscription — rate-limited firehose NATS listener (Phase 7 E2E fixture)
+#
+# noetl/ai-meta#90 Phase 7 — live validation of per-subscription rate
+# limits / backpressure (RFC §9).  A firehose subscription is capped at
+# `limits.max_dispatch_per_sec`; when the budget is exhausted the runtime
+# STOPS FETCHING (it doesn't ack-then-drop), so the unfetched messages
+# stay in the NATS stream (the durable buffer) and are drained later — no
+# loss.  A subscription.rate_limited event marks the engagement.
+#
+# Driven by scripts/kind_validate_subscription_scale.sh (test: ratelimit).
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: ratelimit_firehose_stream
+  path: subscriptions/ratelimit_firehose_stream
+  description: |
+    A firehose NATS subscription capped at a low dispatch rate to prove
+    backpressure: under a burst it throttles fetching (source keeps the
+    backlog) and eventually drains every message — none lost.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  auth: nats_e2e
+  stream: RL_FIREHOSE
+  consumer: rl-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    # A large poll batch so, absent the limit, the whole burst would be
+    # fetched + dispatched at once — the limit is what clamps it.
+    batch: 50
+    timeout_ms: 1000
+
+  dispatch:
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    execution_pool: subscription
+
+  # Phase 7 — per-subscription rate limit / backpressure (RFC §9).
+  limits:
+    max_in_flight: 100
+    max_dispatch_per_sec: 2
