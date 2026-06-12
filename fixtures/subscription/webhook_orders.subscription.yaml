@@ -1,0 +1,61 @@
+# kind: Subscription — push ingress, HMAC-verified webhook (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 3 — live validation of gateway push-ingress
+# (Mode C) + auth-gated directive trust.
+#
+# The gateway terminates the inbound POST /ingress/orders, recomputes the
+# HMAC-SHA256 over the raw body and constant-time-compares it to the
+# `X-Signature` header (secret resolved from the Wallet by alias, never a
+# gateway env var).  ONLY AFTER verification passes does it parse the
+# header directives and forward one POST /api/execute per delivery on the
+# dedicated `subscription` pool.  A tampered/unsigned request is rejected
+# (401) before any directive is parsed — an unauthenticated caller can
+# never drive routing (RFC §6 / §7.5).
+#
+# Driven by scripts/kind_validate_subscription_push.sh.
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: webhook_orders
+  path: subscriptions/webhook_orders
+  description: |
+    HMAC-verified push webhook that dispatches one execution per verified
+    delivery on the dedicated subscription pool.
+
+spec:
+  source: webhook
+  mode: push
+
+  ingress:
+    gateway_path: /ingress/orders
+    verify:
+      type: hmac_sha256
+      header: "X-Signature"
+      # Wallet alias for the HMAC signing key — NOT a gateway env var.
+      secret: "webhook_hmac_secret"
+
+  dispatch:
+    playbook: tests/fixtures/handle_webhook
+    payload_from: message.json
+    # Isolate verified deliveries on the dedicated command segment.
+    execution_pool: subscription
+
+  headers:
+    normalize: true
+    directives:
+      # Header-driven redirect — only these two targets are allowed.
+      # Honored ONLY after HMAC verification passes (auth-gated, §7.5).
+      - header: x-noetl-route
+        controls: dispatch.playbook
+        allowed:
+          - tests/fixtures/handle_webhook
+          - tests/fixtures/handle_webhook_priority
+      - header: x-idempotency-key
+        controls: idempotency_key
+      - header: content-type
+        controls: content_type
+    trace:
+      propagate: w3c
+      baggage_allowlist: ["tenant"]
+    passthrough: data

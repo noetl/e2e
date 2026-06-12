@@ -1,0 +1,51 @@
+# Default per-delivery target playbook for push ingress (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 3 — the playbook the gateway push-ingress
+# dispatches per verified webhook/Pub-Sub delivery by default.  Runs on
+# the dedicated `subscription` pool segment (the gateway sets
+# execution_pool from the subscription's dispatch block).  The normalized
+# message envelope arrives as the execution workload (payload_from:
+# message.json merges a JSON body to the top level + the full envelope
+# under `message`).
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: handle_webhook_priority
+  path: tests/fixtures/handle_webhook_priority
+  description: |
+    Records one ingested webhook delivery.  The dedicated subscription
+    pool drains the command, proving the verified push landed on
+    noetl.commands.subscription.<eid> and not the shared stream.
+
+workflow:
+  - step: start
+    desc: "Handle one verified webhook delivery dispatched by the gateway ingress"
+    tool:
+      kind: python
+      input:
+        order_id: "{{ workload.order_id | default('unknown') }}"
+        amount: "{{ workload.amount | default(0) }}"
+        message_id: "{{ workload.message.id | default('') }}"
+        subscription: "{{ workload.subscription | default('') }}"
+      code: |
+        result = {
+            "handled": True,
+            "via": "priority",
+            "order_id": input_data.get("order_id"),
+            "amount": input_data.get("amount"),
+            "message_id": input_data.get("message_id"),
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Handle complete"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "done"}

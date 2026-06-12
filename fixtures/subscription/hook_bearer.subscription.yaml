@@ -1,0 +1,42 @@
+# kind: Subscription — push ingress, bearer-token-verified webhook (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 3 — the bearer variant of the push-ingress
+# validation.  The gateway constant-time-compares the
+# `Authorization: Bearer <token>` against the expected token (resolved
+# from the Wallet by alias).  A wrong/missing token → 401, no execution,
+# no directives.
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: hook_bearer
+  path: subscriptions/hook_bearer
+  description: |
+    Bearer-token-verified push webhook dispatching one execution per
+    verified delivery on the dedicated subscription pool.
+
+spec:
+  source: webhook
+  mode: push
+
+  ingress:
+    gateway_path: /ingress/hookbearer
+    verify:
+      type: bearer
+      # Wallet alias for the expected bearer token.
+      secret: "hook_bearer_token"
+
+  dispatch:
+    playbook: tests/fixtures/handle_webhook
+    payload_from: message.json
+    execution_pool: subscription
+
+  headers:
+    normalize: true
+    directives:
+      - header: x-noetl-route
+        controls: dispatch.playbook
+        allowed:
+          - tests/fixtures/handle_webhook
+          - tests/fixtures/handle_webhook_priority
+    passthrough: data
