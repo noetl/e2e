@@ -1,0 +1,46 @@
+# Redirect target playbook (E2E fixture)
+#
+# noetl/ai-meta#90 Phase 2 — the playbook the continuous subscription
+# runtime dispatches when a message carries the header-directive
+# `x-noetl-route: tests/fixtures/sub_ingest_priority` (allowlisted in
+# the kind: Subscription).  Proves header-driven dynamic dispatch
+# (RFC §7.3): one subscription fans messages to different playbooks by
+# a trusted, allowlisted header.
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: sub_ingest_priority
+  path: tests/fixtures/sub_ingest_priority
+  description: |
+    Priority-lane ingest — the redirect target a message reaches via
+    the x-noetl-route header directive.
+
+workflow:
+  - step: start
+    desc: "Ingest one priority sensor reading (header-redirected)"
+    tool:
+      kind: python
+      input:
+        device_id: "{{ workload.device_id | default('unknown') }}"
+        message_id: "{{ workload.message.id | default('') }}"
+      code: |
+        result = {
+            "ingested": True,
+            "via": "priority",
+            "device_id": input_data.get("device_id"),
+            "message_id": input_data.get("message_id"),
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: "Priority ingest complete"
+    tool:
+      kind: python
+      input: {}
+      code: |
+        result = {"status": "done"}
