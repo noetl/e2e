@@ -1,0 +1,89 @@
+# kind: Subscription — out-of-cluster Cloud Run runtime, Pub/Sub source + GCS spool
+#
+# noetl/ai-meta#90 Phase 5 — the out-of-cluster (Cloud Run) target.
+#
+# This is the SAME kind: Subscription shape as the in-cluster fixtures; only
+# the source (Google Pub/Sub) and the spool backend (gcs) differ. The runtime
+# is the noetl-worker binary in WORKER_MODE=subscription deployed on Cloud Run
+# (ops automation/cloud-run/), holding the Pub/Sub subscription open and
+# dispatching one POST /api/execute per message to the NoETL server over HTTPS.
+# It holds no DB connection (data-access-boundary).
+#
+# Driven by scripts/kind_validate_subscription_cloudrun.sh, which deploys the
+# Cloud Run service, publishes messages to the source topic, and asserts one
+# COMPLETED child execution per message on the server's event log — then (the
+# spool case) drops the server reachable target so the circuit opens and the
+# messages buffer to the GCS bucket, and restores it so they drain + replay.
+#
+# `${...}` placeholders are substituted by the driver script (the server URL
+# is a tunnel/public URL chosen at run time; project + bucket are stable).
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: cloudrun_pubsub_stream
+  path: subscriptions/cloudrun_pubsub_stream
+  description: |
+    Out-of-cluster Pub/Sub subscription on Cloud Run; dispatches one execution
+    per message over HTTPS and buffers to a GCS spool under a control-plane
+    outage.
+
+spec:
+  source: pubsub
+  mode: pull
+  activation: continuous
+  # Pub/Sub auth is the Cloud Run service account via Workload Identity (ADC) —
+  # "already-in-place trust" (execution-model.md). No source secret in pod env,
+  # no keychain alias for the platform's own subscription.
+  subscription: ${PUBSUB_SUBSCRIPTION}   # projects/<p>/subscriptions/noetl-sub-phase5-pull
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    batch: 10
+    # Real Pub/Sub synchronous-pull latency can exceed a couple of seconds —
+    # a 2s poll window (the in-cluster NATS default) times out before the pull
+    # returns and messages never drain (the Phase-1 pubsub path was validated
+    # only against the emulator). 10s reliably drains real Pub/Sub on Cloud Run.
+    # Tracked: raise the source default / move to streaming pull (noetl/tools).
+    timeout_ms: 10000
+
+  dispatch:
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    execution_pool: subscription
+
+  headers:
+    normalize: true
+    directives:
+      - header: x-idempotency-key
+        controls: idempotency_key
+    trace:
+      propagate: w3c
+    passthrough: data
+
+  # Store-and-forward spool on GCS (RFC §8, Phase 4 engine + Phase 5 gcs backend).
+  spool:
+    # buffer_and_ack: durably write to GCS, then ack — loss-safe across an
+    # arbitrary control-plane outage (the push/out-of-cluster default).
+    mode: buffer_and_ack
+    backend: gcs
+    bucket: ${SPOOL_BUCKET}            # noetl-demo-19700101-sub-spool-phase5
+    ordering: global
+    circuit:
+      trip_after: 2
+      probe_after_ms: 3000
+      probe_interval_ms: 2000
+      downstream:
+        # For an out-of-cluster runtime the "downstream" is the control plane
+        # itself, reached over HTTPS. When it is unreachable the circuit opens
+        # and messages spool to GCS; when it returns they drain + replay.
+        - name: control_plane
+          type: http
+          target: "${NOETL_SERVER_URL}/api/health"
+    retention:
+      max_bytes: 67108864
+      on_full: drop_to_dlq
+    drain:
+      max_replay_attempts: 3
+      on_recovery: ordered_then_live
