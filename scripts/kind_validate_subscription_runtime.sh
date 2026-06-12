@@ -138,9 +138,11 @@ echo "kind-val: creating NATS stream $STREAM + consumer $CONSUMER"
 # ----------------------------------------------------------------------
 echo "kind-val: deploying subscription pool + runtime"
 "${KCTX[@]}" -n "$NS" apply -f "$OPS_MANIFESTS/noetl/worker-rust-subscription-pool-deployment.yaml" >/dev/null
-"${KCTX[@]}" -n "$NS" apply -f "$OPS_MANIFESTS/noetl/subscription-runtime-deployment.yaml" >/dev/null
-"${KCTX[@]}" -n "$NS" set env deploy/noetl-subscription-runtime NOETL_SUBSCRIPTION_PATH="$SUB_PATH" >/dev/null
-"${KCTX[@]}" -n "$NS" rollout restart deploy/noetl-subscription-runtime >/dev/null
+# Render the runtime manifest with the target subscription path (avoid a
+# post-apply `set env` / `rollout restart` that would churn the singleton
+# runtime pod and race its SIGTERM drain — see the Recreate strategy note).
+sed "s#value: subscriptions/iot_sensor_stream#value: $SUB_PATH#" \
+  "$OPS_MANIFESTS/noetl/subscription-runtime-deployment.yaml" | "${KCTX[@]}" -n "$NS" apply -f - >/dev/null
 "${KCTX[@]}" -n "$NS" rollout status deploy/noetl-worker-rust-subscription-pool --timeout=120s >/dev/null
 "${KCTX[@]}" -n "$NS" rollout status deploy/noetl-subscription-runtime --timeout=120s >/dev/null
 
@@ -214,9 +216,9 @@ assert "directives_applied audit events emitted"    "$directives"  "$REDIRECT"
 # Lifecycle: pause → resume, asserting the event trail.
 # ----------------------------------------------------------------------
 echo "kind-val: testing pause/resume lifecycle"
-curl -fsS -X POST "$SERVER_URL/api/subscriptions/$SUB_ID/pause"  >/dev/null
+curl -s -o /dev/null -w "  pause:  HTTP %{http_code}\n"  -X POST "$SERVER_URL/api/subscriptions/$SUB_ID/pause"
 sleep 2
-curl -fsS -X POST "$SERVER_URL/api/subscriptions/$SUB_ID/resume" >/dev/null
+curl -s -o /dev/null -w "  resume: HTTP %{http_code}\n" -X POST "$SERVER_URL/api/subscriptions/$SUB_ID/resume"
 sleep 2
 # Drain + deactivate fire when the runtime shuts down.  Kubernetes sends
 # SIGTERM, so scale the runtime to 0 and assert the runtime drained +
