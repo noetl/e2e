@@ -1,0 +1,54 @@
+# kind: Subscription — opt-in dedup-window NATS listener (Phase 7 E2E fixture)
+#
+# noetl/ai-meta#90 Phase 7 — live validation of the opt-in exactly-once
+# dedup window (RFC §10 OQ1).  A low-volume critical stream opts in with
+# `dedup.enabled: true`; the runtime stamps a dedup key (the
+# `x-idempotency-key` header directive → message_id) on every
+# /api/execute, and the server collapses a duplicate delivery (same key
+# within the window) to a SINGLE execution + a
+# subscription.message.deduplicated event.
+#
+# Driven by scripts/kind_validate_subscription_scale.sh (test: dedup).
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: dedup_critical_stream
+  path: subscriptions/dedup_critical_stream
+  description: |
+    Critical NATS subscription with the opt-in exactly-once dedup window
+    on — a replayed/duplicated message (same idempotency key) creates ONE
+    execution, not two.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  auth: nats_e2e
+  stream: DEDUP_CRITICAL
+  consumer: dedup-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    batch: 50
+    timeout_ms: 2000
+
+  dispatch:
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    execution_pool: subscription
+
+  # Phase 7 — opt-in exactly-once dedup (RFC §10 OQ1).  Off by default
+  # (too costly at IoT scale); on here for this low-volume critical stream.
+  dedup:
+    enabled: true
+    window_secs: 600
+
+  headers:
+    normalize: true
+    directives:
+      # The idempotency key feeds the dedup window (RFC §10 OQ8: the
+      # explicit header wins over message_id).
+      - header: x-idempotency-key
+        controls: idempotency_key
