@@ -1,0 +1,84 @@
+# kind: Subscription — NATS listener with an S3 (MinIO) store-and-forward
+# spool, used to prove BOTH:
+#
+#   * noetl/ai-meta#94 — the `s3` spool backend end-to-end (buffer to MinIO
+#     during an outage, replay in order on recovery), and
+#   * noetl/ai-meta#93 — cross-restart drain: a spool written to the durable
+#     S3 backend (in-memory circuit, kv=None) auto-drains on runtime startup
+#     after the subscription pod is killed mid-outage.
+#
+# Driven by scripts/kind_validate_subscription_spool_s3.sh.  Mirrors the
+# nats_object spool_outage_stream fixture but points the spool at the
+# in-cluster MinIO (ops ci/manifests/minio) via the `s3_spool_minio`
+# keychain credential, and uses ordering: global so the recv_seq high-water
+# recovery (the restart ordering-safety fix) is on the hot path.
+apiVersion: noetl.io/v1
+kind: Subscription
+
+metadata:
+  name: spool_s3_restart_stream
+  path: subscriptions/spool_s3_restart_stream
+  description: |
+    Continuous NATS subscription that buffers to a durable S3 (MinIO) spool
+    when its declared downstream is unavailable, and auto-drains in order on
+    recovery — including across a runtime restart mid-outage.
+
+spec:
+  source: nats
+  mode: pull
+  activation: continuous
+  # NATS SOURCE credential (type nats) — resolved from the server, never a
+  # pod env var (no-default-connection.md + execution-model.md).
+  auth: nats_e2e
+  stream: SPOOL_S3
+  consumer: spool-s3-drain
+
+  runtime:
+    target: dedicated-pool
+    pool: subscription
+    batch: 50
+    timeout_ms: 2000
+
+  dispatch:
+    playbook: tests/fixtures/sub_ingest_default
+    payload_from: message.json
+    execution_pool: subscription
+
+  headers:
+    normalize: true
+    directives:
+      - header: x-idempotency-key
+        controls: idempotency_key
+    trace:
+      propagate: w3c
+    passthrough: data
+
+  # Store-and-forward spool on the S3 backend (noetl/ai-meta#94).
+  spool:
+    mode: buffer_and_ack
+    # s3: durable across a pod restart (unlike an in-pod local_disk) AND
+    # circuit state is in-memory (kv=None) — exactly the cross-restart gap
+    # noetl/ai-meta#93 closes via list-the-spool-on-startup.
+    backend: s3
+    bucket: noetl-spool
+    # Keychain alias for the MinIO bucket credential (external system →
+    # keychain-auth, data-access-boundary.md).
+    credential: s3_spool_minio
+    # Global ordering: the strict receive-order replay that a fresh
+    # recv_seq=1 (after restart) would corrupt without the high-water
+    # recovery — so this exercises the #93 fix directly.
+    ordering: global
+    circuit:
+      trip_after: 2
+      probe_after_ms: 3000
+      probe_interval_ms: 2000
+      downstream:
+        - name: warehouse
+          type: http
+          target: "http://spool-downstream-echo.noetl.svc.cluster.local:5678/"
+    retention:
+      max_bytes: 67108864
+      on_full: drop_to_dlq
+    drain:
+      max_replay_attempts: 3
+      on_recovery: ordered_then_live
