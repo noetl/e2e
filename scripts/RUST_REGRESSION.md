@@ -37,25 +37,25 @@ scripts/rust_regression_batched.sh /tmp/mylist.txt kind-noetl 12
 
 ## The `core` set
 
-**40 deterministic Rust-convention fixtures** — no external APIs, cloud creds,
-Python-era `libs:`/`context.get()`/`data:`-body, **and no `kind: postgres`**.
-All verified green against the Rust control plane on kind (2026-06-14).
-Coverage: basic python + args + large results, loops + iteration isolation,
-control-flow routing, vars/templating/transient, retry (python/http/duckdb),
-fanout/parallelism, sub-playbook composition, output selection, pagination
-(8 patterns), duckdb, http, storage tiers.
+**64 Rust-convention fixtures** — no external cloud APIs/creds, no Python-era
+`libs:`/`context.get()`/`data:`-body. All verified green against the Rust
+control plane on kind (2026-06-14). Coverage: basic python + args + large
+results, loops + iteration isolation, control-flow routing,
+vars/templating/transient, retry (python/http/duckdb), fanout/parallelism,
+sub-playbook composition, output selection, pagination (8 patterns), duckdb,
+http, storage tiers, **and the full postgres-backed batch** (batch execution,
+save-storage, psycopg, auth schema, etc.).
 
-### Why postgres fixtures aren't in `core`
+### The kind credential-store fix that unlocked the postgres batch
 
-A full kind sweep found ~82 fixtures *would* be green, but the **kind
-credential store decrypts non-deterministically** — `pg_k8s`/`pg_local` fetches
-intermittently return `Decryption failed` even after a clean
-delete+re-register, because stale rows persist that the credential API's
-`DELETE`-by-name can't fully purge. So `kind: postgres` fixtures pass
-sometimes and fail others, making them unfit for a stable `core`. Fixing this
-needs a clean credential-store rebuild (direct purge of `noetl.credential` +
-re-register once each) — a kind-infra task, tracked in noetl/ai-meta#98. Once
-done, the ~36 postgres fixtures join `core`.
+Postgres fixtures were originally flaky — intermittent `Decryption failed`.
+Root cause: the kind `noetl-secret` never defined `NOETL_ENCRYPTION_KEY`, so the
+server fell back to a **random default key regenerated on every restart**
+(`NOETL_ALLOW_INSECURE_DEFAULT_KEY=true`); credentials encrypted before a
+restart couldn't decrypt after. Fixed in `noetl/ops`
+`ci/manifests/noetl/secret.yaml` (stable dev key) + re-registering credentials
+— a postgres fixture went from flaky to consistent green and the suite green
+count jumped 40 → 65.
 
 This is the **regression baseline**: grow it by migrating more fixtures to Rust
 conventions (tracked in noetl/ai-meta#98).
