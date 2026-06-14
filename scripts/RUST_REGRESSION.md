@@ -24,14 +24,38 @@ scripts/rust_regression_run.sh http://localhost:18082 core
 scripts/rust_regression_run.sh http://localhost:18082 my-list.txt
 ```
 
+## Batched runner
+
+`rust_regression_batched.sh <list> [context] [chunk]` wraps the runner and
+**restarts the port-forward per chunk**, so long full-suite sweeps don't fail
+when a single `kubectl port-forward` drops (the cause of mass `REG_FAIL` on
+150-fixture runs). Aggregates a final tally to `/tmp/batched_results.txt`.
+
+```bash
+scripts/rust_regression_batched.sh /tmp/mylist.txt kind-noetl 12
+```
+
 ## The `core` set
 
-**26 self-contained, Rust-convention fixtures** — no external APIs, cloud
-creds, or Python-era `libs:` / `context.get()` / `data:`-body blocks. All
-verified green against the Rust control plane on kind (2026-06-14). Coverage:
-basic python + args + large results, loops + iteration isolation, control-flow
-routing, vars/templating/transient, retry, fanout/parallelism, sub-playbook
-composition, output selection.
+**40 deterministic Rust-convention fixtures** — no external APIs, cloud creds,
+Python-era `libs:`/`context.get()`/`data:`-body, **and no `kind: postgres`**.
+All verified green against the Rust control plane on kind (2026-06-14).
+Coverage: basic python + args + large results, loops + iteration isolation,
+control-flow routing, vars/templating/transient, retry (python/http/duckdb),
+fanout/parallelism, sub-playbook composition, output selection, pagination
+(8 patterns), duckdb, http, storage tiers.
+
+### Why postgres fixtures aren't in `core`
+
+A full kind sweep found ~82 fixtures *would* be green, but the **kind
+credential store decrypts non-deterministically** — `pg_k8s`/`pg_local` fetches
+intermittently return `Decryption failed` even after a clean
+delete+re-register, because stale rows persist that the credential API's
+`DELETE`-by-name can't fully purge. So `kind: postgres` fixtures pass
+sometimes and fail others, making them unfit for a stable `core`. Fixing this
+needs a clean credential-store rebuild (direct purge of `noetl.credential` +
+re-register once each) — a kind-infra task, tracked in noetl/ai-meta#98. Once
+done, the ~36 postgres fixtures join `core`.
 
 This is the **regression baseline**: grow it by migrating more fixtures to Rust
 conventions (tracked in noetl/ai-meta#98).
