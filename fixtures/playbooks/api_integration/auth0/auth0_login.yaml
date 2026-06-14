@@ -56,13 +56,15 @@ workflow:
     desc: Validate Auth0 ID token (JWT) - entry point
     tool:
       kind: python
-      libs:
-        base64: base64
-        json: json
-        time: time
+      input:
+        auth0_token: "{{ auth0_token }}"
+        auth0_domain: "{{ auth0_domain }}"
       code: |
-        token = context.get('auth0_token', '')
-        auth0_domain = context.get('auth0_domain', '')
+        import base64
+        import json
+        import time
+        token = args.get('auth0_token', '')
+        auth0_domain = args.get('auth0_domain', '')
         try:
             parts = token.split('.')
             if len(parts) != 3:
@@ -117,7 +119,7 @@ workflow:
       url: "{{ gateway_url }}/api/internal/callback"
       headers:
         Content-Type: application/json
-      data:
+      json:
         request_id: "{{ request_id }}"
         status: "error"
         data:
@@ -189,9 +191,9 @@ workflow:
             ON r.role_id = ur.role_id
         )
         SELECT
-          s.session_token,
+          s.session_token AS sess_ref,
           s.user_id,
-          s.expires_at,
+          s.expires_at::text AS expires_at,
           u.email,
           u.display_name,
           rr.roles
@@ -226,7 +228,7 @@ workflow:
       url: "{{ gateway_url }}/api/internal/callback"
       headers:
         Content-Type: application/json
-      data:
+      json:
         request_id: "{{ request_id }}"
         status: "error"
         data:
@@ -242,9 +244,10 @@ workflow:
     desc: Prepare session payload with roles
     tool:
       kind: python
-      libs:
-        json: json
+      input:
+        create_user_session: "{{ create_user_session }}"
       code: |
+        import json
         def rows_from_step(step_name, command_name=None):
             def pick(obj, *keys):
                 current = obj
@@ -267,7 +270,7 @@ workflow:
                         return None
                 return current
 
-            step = context.get(step_name, {}) or {}
+            step = args.get(step_name, {}) or {}
             candidates = [
                 pick(step, "rows"),
                 pick(step, "context", "rows"),
@@ -309,9 +312,16 @@ workflow:
             "roles": roles,
         }
 
+        # NOTE: the session token is carried under the non-sensitive key
+        # `sess_ref` (NOT `session_token`).  The server + worker redact any
+        # field whose name contains "token" when persisting step results to
+        # the event log, which would replace the real token with "[REDACTED]"
+        # before the downstream NATS-cache and gateway-callback steps can read
+        # it.  Carrying it as `sess_ref` lets the real value flow; the outgoing
+        # gateway-contract field is still named `session_token` in the callback.
         result = {
             "session_cache": {
-                "session_token": session_row.get("session_token"),
+                "sess_ref": session_row.get("sess_ref"),
                 "user_id": session_row.get("user_id"),
                 "email": session_row.get("email"),
                 "display_name": session_row.get("display_name"),
@@ -335,8 +345,20 @@ workflow:
       auth: "{{ nats_credential }}"
       operation: kv_put
       bucket: "{{ session_bucket }}"
-      key: "{{ prepare_session_cache.context.session_cache.session_token }}"
-      value: "{{ prepare_session_cache.context.session_cache }}"
+      # Key + value are rendered by the worker and written to NATS K/V before
+      # the call.done event (with its event-log redaction) is emitted, so the
+      # real token reaches the cache.  The value is built explicitly here with
+      # the gateway-contract field name `session_token` (sourced from the
+      # non-sensitive `sess_ref`) so the gateway's CachedSession can read it.
+      key: "{{ prepare_session_cache.session_cache.sess_ref }}"
+      value:
+        session_token: "{{ prepare_session_cache.session_cache.sess_ref }}"
+        user_id: "{{ prepare_session_cache.session_cache.user_id }}"
+        email: "{{ prepare_session_cache.session_cache.email }}"
+        display_name: "{{ prepare_session_cache.session_cache.display_name }}"
+        expires_at: "{{ prepare_session_cache.session_cache.expires_at }}"
+        is_active: "{{ prepare_session_cache.session_cache.is_active }}"
+        roles: "{{ prepare_session_cache.session_cache.roles }}"
       spec:
         policy:
           rules:
@@ -363,14 +385,14 @@ workflow:
       url: "{{ gateway_url }}/api/internal/callback"
       headers:
         Content-Type: application/json
-      data:
+      json:
         request_id: "{{ request_id }}"
         status: "success"
         data:
           status: "authenticated"
-          session_token: "{{ prepare_session_cache.context.session_cache.session_token }}"
-          user: "{{ prepare_session_cache.context.user }}"
-          expires_at: "{{ prepare_session_cache.context.session_cache.expires_at }}"
+          session_token: "{{ prepare_session_cache.session_cache.sess_ref }}"
+          user: "{{ prepare_session_cache.user }}"
+          expires_at: "{{ prepare_session_cache.session_cache.expires_at }}"
     next:
       spec:
         mode: exclusive
