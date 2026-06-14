@@ -18,7 +18,7 @@ workload:
   pg_database: demo_noetl
 
 workflow:
-  - step: maintain_pft_queue
+  - step: start
     desc: Add reclaim index concurrently, tune autovacuum, and vacuum queue table
     tool:
       kind: python
@@ -127,7 +127,7 @@ workflow:
     tool:
       kind: python
       input:
-        maintenance: "{{ maintain_pft_queue }}"
+        maintenance: "{{ start }}"
       code: |
         result = {
             "status": "complete",

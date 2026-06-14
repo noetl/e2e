@@ -10,7 +10,7 @@ workload:
   sample_image_alt: "NoETL widget coverage pixel"
 
 workflow:
-  - step: emit_all_widgets
+  - step: start
     desc: Emit one terminal-prompt render tree covering every GUI widget kind.
     tool:
       kind: python

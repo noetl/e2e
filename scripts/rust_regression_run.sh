@@ -29,16 +29,38 @@ cd "$REPO_ROOT" || exit 2
 # large-result extraction, output selection.  Extend deliberately as more
 # fixtures are migrated to Rust conventions (see noetl/ai-meta#98).
 CORE_FIXTURES=(
+  # basic python + args + large results
   "fixtures/playbooks/hello_world/hello_world.yaml"
   "fixtures/playbooks/simple_python.yaml"
   "fixtures/playbooks/actions_test.yaml"
   "fixtures/playbooks/comprehensive_test.yaml"
-  "fixtures/playbooks/root_scripts/test_simple_loop.yaml"
-  "fixtures/playbooks/root_scripts/test_implicit_end_routing.yaml"
-  "fixtures/playbooks/fanout_reduce/fanout_reduce_phase6.yaml"
-  "fixtures/playbooks/playbook_composition/user_profile_scorer.yaml"
+  "fixtures/playbooks/test_args_passing.yaml"
   "fixtures/playbooks/test_large_result_extraction.yaml"
   "fixtures/playbooks/test_output_select.yaml"
+  # loops + iteration isolation
+  "fixtures/playbooks/loop_test.yaml"
+  "fixtures/playbooks/root_scripts/test_simple_loop.yaml"
+  "fixtures/playbooks/test_loop_instance_isolation/playbook.yaml"
+  "fixtures/playbooks/load_test/heavy_loop_aggregation/heavy_loop_aggregation.yaml"
+  # control-flow routing
+  "fixtures/playbooks/root_scripts/test_implicit_end_routing.yaml"
+  "fixtures/playbooks/root_scripts/test_script_loading.yaml"
+  "fixtures/playbooks/test_start_with_action.yaml"
+  "fixtures/playbooks/test_end_with_action.yaml"
+  "fixtures/playbooks/control_flow_workbook/control_flow_workbook.yaml"
+  # vars / templating / transient
+  "fixtures/playbooks/vars_test/test_vars_simple.yaml"
+  "fixtures/playbooks/vars_test/test_vars_template_access.yaml"
+  "fixtures/playbooks/vars_test/test_vars_block.yaml"
+  "fixtures/playbooks/vars_test/test_vars_api.yaml"
+  "fixtures/playbooks/vars_test/test_transient.yaml"
+  # retry, fanout/parallelism, sub-playbook composition
+  "fixtures/playbooks/retry_test/python_retry_exception.yaml"
+  "fixtures/playbooks/fanout_reduce/fanout_reduce_phase6.yaml"
+  "fixtures/playbooks/playbook_composition/user_profile_scorer.yaml"
+  # migrated to Rust conventions (entry step renamed to 'start' — #98)
+  "fixtures/playbooks/gui/widget_all_types/widget_all_types.yaml"
+  "fixtures/playbooks/pft_flow_test/pft_queue_db_maintenance.yaml"
 )
 
 if [ "$SET" = "core" ]; then
