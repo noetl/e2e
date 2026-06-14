@@ -26,14 +26,33 @@ scripts/rust_regression_run.sh http://localhost:18082 my-list.txt
 
 ## The `core` set
 
-Self-contained, Rust-convention fixtures — no external APIs, cloud creds, or
-Python-era `libs:` / `context.get()` / `data:`-body blocks. Verified green
-against the Rust control plane on kind (2026-06-14). Coverage: basic python,
-loops, control-flow routing, fanout/parallelism, sub-playbook composition,
-large-result extraction, output selection.
+**26 self-contained, Rust-convention fixtures** — no external APIs, cloud
+creds, or Python-era `libs:` / `context.get()` / `data:`-body blocks. All
+verified green against the Rust control plane on kind (2026-06-14). Coverage:
+basic python + args + large results, loops + iteration isolation, control-flow
+routing, vars/templating/transient, retry, fanout/parallelism, sub-playbook
+composition, output selection.
 
 This is the **regression baseline**: grow it by migrating more fixtures to Rust
-conventions (tracked in noetl/ai-meta#98). Known Python-era failures the broader
-suite still has — `data:`→`json:` http bodies, `libs:`→explicit `import`,
-`context.get()`→`input:`/`args`, `python` tool `source.type: inline` configs —
-are the same class fixed for `auth0_login` (noetl/e2e#51).
+conventions (tracked in noetl/ai-meta#98).
+
+### Migration patterns (Rust engine vs the Python era)
+
+The same class of fixes done for `auth0_login` (noetl/e2e#51) applies across the
+suite:
+
+- **Entry step must be named `start`** — the Rust engine requires it
+  (`Workflow must have a step named 'start'`). Rename the entry step and any
+  `{{ <old_name> }}` result references. (Migrated `widget_all_types`,
+  `pft_queue_db_maintenance` this way.)
+- **`libs:` → explicit `import`** in python tool code.
+- **`context.get()` → `input:` binding + `args.get()`**.
+- **http body `data:` → `json:`**.
+- **`python` tool `source.type: inline` → `code:`**.
+
+### Not in `core` (need resources or unsupported kinds)
+
+External-resource fixtures (GCS / OpenAI / external HTTP fetch / IB / local
+script files) and ones using tool kinds not ported to Rust (e.g. `kind: agent`
+in `spike_e2e_test`) are excluded — they need creds/resources or engine work,
+not just convention migration. See noetl/ai-meta#98 for the backlog.
