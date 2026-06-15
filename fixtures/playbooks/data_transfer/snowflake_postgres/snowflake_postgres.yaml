@@ -32,10 +32,11 @@ workflow:
     tool:
       kind: snowflake
       auth: "{{ sf_auth }}"
+      # Session context (warehouse/database/schema/role) comes from the
+      # credential and is applied per-request by the snowflake tool — the
+      # SQL REST API rejects `USE` statements (code 391911).
       command: |
         CREATE DATABASE IF NOT EXISTS TEST_DB;
-        USE DATABASE TEST_DB;
-        USE SCHEMA PUBLIC;
     next:
       spec:
         mode: exclusive
