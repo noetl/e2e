@@ -96,8 +96,33 @@ CORE_FIXTURES=(
   "fixtures/playbooks/vars_test/test_vars_simple.yaml"
 )
 
+# Integration tier — external-service fixtures that need REAL credentials and
+# have SIDE EFFECTS / cost (LLM API calls, real GCS/Snowflake, brokerage
+# gateways).  NOT part of the exit-0 `core` gate; run deliberately with creds
+# registered.  Verified green on kind 2026-06-14 with real creds.  See
+# scripts/RUST_REGRESSION.md for the per-fixture credential + side-effect notes.
+INTEGRATION_FIXTURES=(
+  # Amadeus travel API (test env, read-only GET searches)
+  "fixtures/playbooks/api_integration/amadeus_ai_api/amadeus_ai_api.yaml"
+  "fixtures/playbooks/api_integration/amadeus_ai_api/amadeus_ai_api_test.yaml"
+  "fixtures/playbooks/api_integration/amadeus_ai_chat_request_query/amadeus_ai_chat_request_query.yaml"
+  "fixtures/playbooks/api_integration/amadeus_ai_token_smoke/amadeus_ai_token_smoke.yaml"
+  # OpenAI / Anthropic LLM (real API calls — $ per run)
+  "fixtures/playbooks/ops/execution_ai_analyze/execution_ai_analyze.yaml"
+  "fixtures/playbooks/ops/playbook_ai_explain/playbook_ai_explain.yaml"
+  "fixtures/playbooks/ops/playbook_ai_generate/playbook_ai_generate.yaml"
+  # external HTTP (open-meteo) + non-blocking tooling load
+  "fixtures/playbooks/control_flow/weather_control_flow/weather_control_flow.yaml"
+  "fixtures/playbooks/load_test/tooling_non_blocking/tooling_non_blocking.yaml"
+  # Interactive Brokers connection-checks (gracefully handle no gateway)
+  "fixtures/playbooks/interactive_brokers/ibkr_gateway_maintain.yaml"
+  "fixtures/playbooks/interactive_brokers/ibkr_gateway_verify.yaml"
+)
+
 if [ "$SET" = "core" ]; then
   FILES=("${CORE_FIXTURES[@]}")
+elif [ "$SET" = "integration" ]; then
+  FILES=("${INTEGRATION_FIXTURES[@]}")
 else
   # Portable (bash 3.2 / macOS) read of a newline list, skipping blanks/comments.
   FILES=()
