@@ -80,3 +80,37 @@ External-resource fixtures (GCS / OpenAI / external HTTP fetch / IB / local
 script files) and ones using tool kinds not ported to Rust (e.g. `kind: agent`
 in `spike_e2e_test`) are excluded — they need creds/resources or engine work,
 not just convention migration. See noetl/ai-meta#98 for the backlog.
+
+## The `integration` set
+
+```bash
+scripts/rust_regression_run.sh http://localhost:18082 integration
+```
+
+**12 external-service fixtures** that need **real credentials** and have
+**side effects / cost** — NOT part of the exit-0 `core` gate; run deliberately.
+Verified green on kind 2026-06-14 with real creds registered (local
+`/credentials` dir + GCP Secret Manager, project `noetl-demo-19700101`).
+
+| Fixtures | Credential | Side effect on run |
+| --- | --- | --- |
+| `amadeus_ai_*` (×4) | Amadeus test API (Secret Manager) | read-only GET — safe |
+| `ops/*_ai_*` (×3) | OpenAI/Anthropic (Secret Manager via google-oauth) | **$ per call** |
+| `weather_control_flow`, `tooling_non_blocking` | open-meteo / mixed | external HTTP |
+| `ibkr_gateway_{verify,maintain}` | `ib_gateway` | brokerage gateway (no-op without a running gateway) |
+
+Register creds first: external-service cred JSONs from the local `credentials`
+dir (NOT the `pg_*` ones — those point at prod) + OpenAI/Amadeus from Secret
+Manager.
+
+### Known external failures (not in `integration`)
+
+- **Snowflake** (`snowflake_postgres`, `http_to_databases`) — the Rust worker's
+  credential resolver doesn't yet handle the `snowflake` credential type
+  (`unsupported type 'snowflake'`); tracked + fixed separately.
+- **IB trading endpoints** (`gateway_test`, `ibkr/api`, `ibkr/history`) — need a
+  live IB gateway; fail on connection in kind.
+- `cache_simple` — `malformed tool config` (convention); `spike_e2e_test` —
+  `kind: agent` unsupported in the Rust engine.
+- `matrixcare_snowflake_prod` fixtures are **deliberately excluded** (prod
+  Snowflake).
