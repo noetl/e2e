@@ -35,6 +35,11 @@
 #   6. (informational) System-pool isolation: the system-pool worker shows
 #      orchestrate-plugin activity; the default (user) worker pool ran no
 #      `__orchestrate__` meta-step.
+#   7. Large-context convergence (noetl/ai-meta#113): a fixture whose drive
+#      result exceeds the worker's 100KB inline budget reaches COMPLETED with a
+#      BOUNDED `__orchestrate__` command count, ZERO decode errors, and the
+#      offloaded-ref resolve path exercised (`ref_resolved` advanced). Guards
+#      the bug where an offloaded drive result was dropped → non-convergent loop.
 #
 # Preconditions: the kind server must run a post-#110 image (server f3043c9 /
 # v3.28.0 or later) with the worker-driven drive ON — either the code default
@@ -81,10 +86,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURE_PATH="$REPO_ROOT/fixtures/playbooks/fanout_reduce/fanout_reduce_phase6.yaml"
 PLAYBOOK_PATH="tests/fixtures/fanout_reduce_phase6"
+# Large-context convergence fixture (noetl/ai-meta#113).  Its accumulated
+# execution context drives an `__orchestrate__` result well past the worker's
+# 100KB inline budget (~785KB observed), so the worker offloads the drive
+# result to the durable result store and the server must resolve+decode the
+# ref instead of dropping it — otherwise the drive never converges.  Self-
+# contained (no external creds), so it runs anywhere this rig runs.
+LARGE_FIXTURE_PATH="$REPO_ROOT/fixtures/playbooks/test_large_result_extraction.yaml"
+LARGE_PLAYBOOK_PATH="tests/large_result_extraction_test"
+# Bound on `__orchestrate__` commands a converging large-context run may issue.
+# A healthy run converges in a handful of cycles; the #113 stall produced
+# 200+ PENDING orchestrate commands on a single execution.  Generous ceiling
+# that still catches a runaway loop.
+LARGE_ORCH_CMD_CEILING="${NOETL_ORCH_LARGE_CMD_CEILING:-30}"
 
 echo "kind-val: context=$KIND_CONTEXT namespace=$NAMESPACE"
 echo "kind-val: server=$NOETL_SERVER_URL"
 echo "kind-val: fixture=$FIXTURE_PATH"
+echo "kind-val: large-context fixture=$LARGE_FIXTURE_PATH (#113 convergence)"
 
 # ----------------------------------------------------------------------
 # Preflight — required tooling + cluster + server reachable.
@@ -268,6 +287,78 @@ if [[ "${USER_HITS:-0}" -gt 0 ]]; then
 fi
 
 # ----------------------------------------------------------------------
+# 7. Large-context convergence (noetl/ai-meta#113).
+#
+#    Regression guard for the off-server-drive bug where an over-budget
+#    `__orchestrate__` drive result (the full execution context > 100KB) was
+#    offloaded by the worker to the durable result store WITHOUT an inline
+#    `output_b64`; the server's completion handler decoded only the inline form,
+#    dropped the drive decision, and re-looped — 200+ PENDING `__orchestrate__`
+#    commands, no terminal event.  The fix resolves the offloaded ref before
+#    giving up.  This phase proves a large-context fixture CONVERGES: reaches
+#    COMPLETED, with a BOUNDED orchestrate-command count and ZERO decode errors.
+# ----------------------------------------------------------------------
+echo
+echo "================================================================"
+echo "kind-val: large-context convergence (#113) — $LARGE_FIXTURE_PATH"
+echo "================================================================"
+
+if [[ ! -f "$LARGE_FIXTURE_PATH" ]]; then
+  fail "large-context fixture not found: $LARGE_FIXTURE_PATH"
+else
+  DECODE_ERR_L_BEFORE="$(metrics_drive decode_error "$(fetch_metrics)")"
+  REF_RESOLVED_BEFORE="$(metrics_drive ref_resolved "$(fetch_metrics)")"
+
+  noetl register playbook --file "$LARGE_FIXTURE_PATH"
+  LARGE_EID="$(noetl exec "$LARGE_PLAYBOOK_PATH" --runtime distributed --json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
+  echo "kind-val: large-context execution_id=$LARGE_EID"
+
+  LARGE_DEADLINE=$(( SECONDS + TIMEOUT_SECS ))
+  LARGE_STATUS=""
+  while [[ $SECONDS -lt $LARGE_DEADLINE ]]; do
+    LARGE_STATUS="$(noetl status "$LARGE_EID" --json 2>/dev/null \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))' || true)"
+    case "$LARGE_STATUS" in COMPLETED|FAILED) break ;; esac
+    sleep 2
+  done
+  sleep 3
+  DECODE_ERR_L_AFTER="$(metrics_drive decode_error "$(fetch_metrics)")"
+  REF_RESOLVED_AFTER="$(metrics_drive ref_resolved "$(fetch_metrics)")"
+  DECODE_ERR_L_DELTA=$(( DECODE_ERR_L_AFTER - DECODE_ERR_L_BEFORE ))
+  REF_RESOLVED_DELTA=$(( REF_RESOLVED_AFTER - REF_RESOLVED_BEFORE ))
+
+  LARGE_ORCH_CMDS="$(count_rows \
+    "SELECT COUNT(*) AS n FROM noetl.command WHERE execution_id = $LARGE_EID AND step_name = '__orchestrate__'")"
+  LARGE_ORCH_EVENTS="$(count_rows \
+    "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $LARGE_EID AND node_name = '__orchestrate__'")"
+  echo "kind-val: large-context — status=$LARGE_STATUS orch_cmds=$LARGE_ORCH_CMDS orch_events=$LARGE_ORCH_EVENTS decode_error=+$DECODE_ERR_L_DELTA ref_resolved=+$REF_RESOLVED_DELTA"
+
+  # 7a. Converged to COMPLETED (not stuck RUNNING in a re-drive loop).
+  [[ "$LARGE_STATUS" == "COMPLETED" ]] \
+    || fail "large-context fixture did not converge: status=$LARGE_STATUS (the #113 stall, or a slow run beyond ${TIMEOUT_SECS}s)"
+
+  # 7b. ZERO decode errors — the offloaded result was decoded, not dropped.
+  [[ "$DECODE_ERR_L_DELTA" -eq 0 ]] \
+    || fail "noetl_orchestrate_drive_total{stage=decode_error} advanced (+$DECODE_ERR_L_DELTA) on a large-context run — the offloaded OrchestrationResult was dropped (#113 regression)"
+
+  # 7c. The offloaded path was actually exercised — `ref_resolved` advanced.
+  #     Proves this fixture genuinely crossed the inline budget (so the guard
+  #     is real, not vacuously green on a small result).
+  [[ "$REF_RESOLVED_DELTA" -ge 1 ]] \
+    || fail "noetl_orchestrate_drive_total{stage=ref_resolved} did not advance (+$REF_RESOLVED_DELTA) — the large-context fixture did not exceed the inline budget, so this phase did not exercise the #113 path"
+
+  # 7d. Bounded orchestrate-command count — no runaway PENDING loop.
+  [[ "${LARGE_ORCH_CMDS:-9999}" -le "$LARGE_ORCH_CMD_CEILING" ]] \
+    || fail "large-context run issued $LARGE_ORCH_CMDS __orchestrate__ commands (> ceiling $LARGE_ORCH_CMD_CEILING) — runaway drive loop (#113)"
+
+  # 7e. Still zero __orchestrate__ rows in noetl.event (suppression/sole-writer
+  #     intact even on the offloaded path).
+  [[ "$LARGE_ORCH_EVENTS" == "0" ]] \
+    || fail "large-context run wrote $LARGE_ORCH_EVENTS __orchestrate__ rows to noetl.event (expected 0)"
+fi
+
+# ----------------------------------------------------------------------
 # Report.
 # ----------------------------------------------------------------------
 
@@ -280,6 +371,7 @@ if [[ "$OVERALL" -eq 0 ]]; then
   echo "  - __orchestrate__ in noetl.command = $ORCH_COMMAND_ROWS (off-server dispatch)"
   echo "  - drive metric: dispatched +$DISPATCHED_DELTA / applied +$APPLIED_DELTA / decode_error +$DECODE_ERR_DELTA"
   echo "  - noetl_orchestrate_shadow_total absent (#110 retirement confirmed)"
+  echo "  - large-context (#113): status=${LARGE_STATUS:-skipped} orch_cmds=${LARGE_ORCH_CMDS:-?} (<= $LARGE_ORCH_CMD_CEILING) ref_resolved=+${REF_RESOLVED_DELTA:-?} decode_error=+${DECODE_ERR_L_DELTA:-?}"
   echo "================================================================"
   exit 0
 fi
