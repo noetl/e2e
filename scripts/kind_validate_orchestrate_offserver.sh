@@ -40,6 +40,13 @@
 #      BOUNDED `__orchestrate__` command count, ZERO decode errors, and the
 #      offloaded-ref resolve path exercised (`ref_resolved` advanced). Guards
 #      the bug where an offloaded drive result was dropped → non-convergent loop.
+#   8. Oversized next-command context offload (noetl/ai-meta#114): a fixture
+#      whose next-step command context exceeds the NATS max_payload reaches
+#      COMPLETED, the offload path fired (`context_offloaded` advanced) + the
+#      worker resolved it (`context_ref_resolved` advanced), and NO
+#      `command.issued` event for the run exceeds the NATS ceiling. Guards the
+#      bug where the full upstream context embedded in `command.issued` blew the
+#      1MB publish limit → wedge.
 #
 # Preconditions: the kind server must run a post-#110 image (server f3043c9 /
 # v3.28.0 or later) with the worker-driven drive ON — either the code default
@@ -99,11 +106,23 @@ LARGE_PLAYBOOK_PATH="tests/large_result_extraction_test"
 # 200+ PENDING orchestrate commands on a single execution.  Generous ceiling
 # that still catches a runaway loop.
 LARGE_ORCH_CMD_CEILING="${NOETL_ORCH_LARGE_CMD_CEILING:-30}"
+# Oversized next-command-context fixture (noetl/ai-meta#114).  A ~900KB upstream
+# result, embedded by the drive (refs_in_state false) into the NEXT command's
+# render_context, makes that `command.issued` event exceed the NATS max_payload —
+# which wedged the publish-only gate before the offload fix.  This fixture reads
+# only a small scalar downstream (no `_ref` lazy-load), so it completes
+# end-to-end and isolates the #114 offload mechanism — unlike test_output_select,
+# whose `{{ start._ref }}` artifact lazy-load also depends on the refs_in_state
+# consume side (noetl/ai-meta#101) and so does not complete under refs_in_state
+# false even with the oversized-event offload in place.
+OVERSIZE_FIXTURE_PATH="$REPO_ROOT/fixtures/playbooks/test_oversize_command_context.yaml"
+OVERSIZE_PLAYBOOK_PATH="tests/oversize_command_context"
 
 echo "kind-val: context=$KIND_CONTEXT namespace=$NAMESPACE"
 echo "kind-val: server=$NOETL_SERVER_URL"
 echo "kind-val: fixture=$FIXTURE_PATH"
 echo "kind-val: large-context fixture=$LARGE_FIXTURE_PATH (#113 convergence)"
+echo "kind-val: oversized-context fixture=$OVERSIZE_FIXTURE_PATH (#114 command-event offload)"
 
 # ----------------------------------------------------------------------
 # Preflight — required tooling + cluster + server reachable.
@@ -359,6 +378,86 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# 8. Oversized next-command context offload (noetl/ai-meta#114).
+#
+#    Regression guard for the SECOND off-server-drive stall #113 surfaced:
+#    with `refs_in_state` false the drive embeds the FULL resolved upstream
+#    context into the NEXT step's command, so its `command.issued` event grew
+#    past the NATS `max_payload` (1MB) under the publish-only gate (~1.32MB
+#    observed for test_output_select's `verify_extracted_fields`), so the
+#    publish never acked and the execution wedged (`step.enter` persisted,
+#    command never issued).  The fix offloads an over-budget command context to
+#    the result store with a `noetl://` ref so the published event stays small;
+#    `get_command`/`claim_command` resolve it on the read side.  This phase
+#    drives `test_oversize_command_context` (a ~900KB upstream result, consumed
+#    via a small scalar — no `_ref` lazy-load) and proves it CONVERGES, the
+#    offload path was exercised, and NO `command.issued` event for the run
+#    exceeds the NATS ceiling.
+# ----------------------------------------------------------------------
+echo
+echo "================================================================"
+echo "kind-val: oversized next-command context offload (#114) — $OVERSIZE_FIXTURE_PATH"
+echo "================================================================"
+
+NATS_MAX_PAYLOAD="${NOETL_NATS_MAX_PAYLOAD:-1048576}"
+
+if [[ ! -f "$OVERSIZE_FIXTURE_PATH" ]]; then
+  fail "oversized-context fixture not found: $OVERSIZE_FIXTURE_PATH"
+else
+  OFFLOADED_BEFORE="$(metrics_drive context_offloaded "$(fetch_metrics)")"
+  CTX_RESOLVED_BEFORE="$(metrics_drive context_ref_resolved "$(fetch_metrics)")"
+
+  noetl register playbook --file "$OVERSIZE_FIXTURE_PATH"
+  OVERSIZE_EID="$(noetl exec "$OVERSIZE_PLAYBOOK_PATH" --runtime distributed --json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
+  echo "kind-val: oversized-context execution_id=$OVERSIZE_EID"
+
+  OVERSIZE_DEADLINE=$(( SECONDS + TIMEOUT_SECS ))
+  OVERSIZE_STATUS=""
+  while [[ $SECONDS -lt $OVERSIZE_DEADLINE ]]; do
+    OVERSIZE_STATUS="$(noetl status "$OVERSIZE_EID" --json 2>/dev/null \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))' || true)"
+    case "$OVERSIZE_STATUS" in COMPLETED|FAILED) break ;; esac
+    sleep 2
+  done
+  sleep 3
+  OFFLOADED_AFTER="$(metrics_drive context_offloaded "$(fetch_metrics)")"
+  CTX_RESOLVED_AFTER="$(metrics_drive context_ref_resolved "$(fetch_metrics)")"
+  OFFLOADED_DELTA=$(( OFFLOADED_AFTER - OFFLOADED_BEFORE ))
+  CTX_RESOLVED_DELTA=$(( CTX_RESOLVED_AFTER - CTX_RESOLVED_BEFORE ))
+
+  # Largest command.issued event context this run wrote (materialized under the
+  # gate).  Offloaded contexts are the tiny `{__context_ref__: ...}` marker, so
+  # the max must sit well under the NATS ceiling.
+  OVERSIZE_MAX_CTX="$(count_rows \
+    "SELECT COALESCE(MAX(octet_length(context::text)), 0) AS n FROM noetl.event WHERE execution_id = $OVERSIZE_EID AND event_type = 'command.issued'")"
+  OVERSIZE_ORCH_EVENTS="$(count_rows \
+    "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $OVERSIZE_EID AND node_name = '__orchestrate__'")"
+  echo "kind-val: oversized-context — status=$OVERSIZE_STATUS max_command_issued_ctx=${OVERSIZE_MAX_CTX}B (ceiling ${NATS_MAX_PAYLOAD}B) context_offloaded=+$OFFLOADED_DELTA context_ref_resolved=+$CTX_RESOLVED_DELTA"
+
+  # 8a. Converged to COMPLETED (not wedged on the publish wall).
+  [[ "$OVERSIZE_STATUS" == "COMPLETED" ]] \
+    || fail "oversized-context fixture did not converge: status=$OVERSIZE_STATUS (the #114 publish-wall wedge, or a slow run beyond ${TIMEOUT_SECS}s)"
+
+  # 8b. The offload path actually fired — proves this fixture genuinely produced
+  #     an over-budget command context (the guard is real, not vacuously green).
+  [[ "$OFFLOADED_DELTA" -ge 1 ]] \
+    || fail "noetl_orchestrate_drive_total{stage=context_offloaded} did not advance (+$OFFLOADED_DELTA) — the fixture did not exceed NOETL_COMMAND_CONTEXT_MAX_BYTES, so this phase did not exercise the #114 path"
+
+  # 8c. The worker read path resolved the offloaded context back.
+  [[ "$CTX_RESOLVED_DELTA" -ge 1 ]] \
+    || fail "noetl_orchestrate_drive_total{stage=context_ref_resolved} did not advance (+$CTX_RESOLVED_DELTA) — worker never resolved the offloaded command context"
+
+  # 8d. No command.issued event for the run exceeds the NATS max_payload.
+  [[ "${OVERSIZE_MAX_CTX:-0}" -gt 0 && "${OVERSIZE_MAX_CTX:-0}" -lt "$NATS_MAX_PAYLOAD" ]] \
+    || fail "a command.issued event context for execution $OVERSIZE_EID is ${OVERSIZE_MAX_CTX}B (>= NATS max_payload ${NATS_MAX_PAYLOAD}B) — the #114 oversized-event regression"
+
+  # 8e. Still zero __orchestrate__ rows in noetl.event (sole-writer intact).
+  [[ "$OVERSIZE_ORCH_EVENTS" == "0" ]] \
+    || fail "oversized-context run wrote $OVERSIZE_ORCH_EVENTS __orchestrate__ rows to noetl.event (expected 0)"
+fi
+
+# ----------------------------------------------------------------------
 # Report.
 # ----------------------------------------------------------------------
 
@@ -372,6 +471,7 @@ if [[ "$OVERALL" -eq 0 ]]; then
   echo "  - drive metric: dispatched +$DISPATCHED_DELTA / applied +$APPLIED_DELTA / decode_error +$DECODE_ERR_DELTA"
   echo "  - noetl_orchestrate_shadow_total absent (#110 retirement confirmed)"
   echo "  - large-context (#113): status=${LARGE_STATUS:-skipped} orch_cmds=${LARGE_ORCH_CMDS:-?} (<= $LARGE_ORCH_CMD_CEILING) ref_resolved=+${REF_RESOLVED_DELTA:-?} decode_error=+${DECODE_ERR_L_DELTA:-?}"
+  echo "  - oversized-context (#114): status=${OVERSIZE_STATUS:-skipped} max_command_issued_ctx=${OVERSIZE_MAX_CTX:-?}B (< ${NATS_MAX_PAYLOAD:-?}B) context_offloaded=+${OFFLOADED_DELTA:-?} context_ref_resolved=+${CTX_RESOLVED_DELTA:-?}"
   echo "================================================================"
   exit 0
 fi
