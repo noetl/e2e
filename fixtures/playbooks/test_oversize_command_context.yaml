@@ -1,0 +1,54 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: test_oversize_command_context
+  path: tests/oversize_command_context
+  description: 'noetl/ai-meta#114 regression guard — a step whose NEXT-command
+    render_context exceeds the NATS max_payload (1MB).
+
+
+    With the off-server orchestrate drive and refs_in_state=false, the drive
+    embeds the full resolved upstream context into the next step''s command, so
+    its command.issued event grew past NATS max_payload and (under the
+    publish-only gate) never acked → the execution wedged.  The fix offloads an
+    over-budget command context to the result store with a noetl:// ref marker on
+    the event + command row, resolved on the read side (get_command /
+    claim_command), so the published event stays small.
+
+
+    Unlike test_output_select (which lazy-loads via {{ start._ref }} and so also
+    depends on the refs_in_state consume side, noetl/ai-meta#101), this fixture
+    only reads a small scalar from the large upstream context — no _ref, no
+    lazy-load — so it completes end-to-end and isolates the #114 offload
+    mechanism.'
+workload:
+  blob_kb: 900
+workflow:
+- step: start
+  tool:
+  - name: gen
+    kind: python
+    input:
+      kb: '{{ blob_kb }}'
+    code: "# Emit a ~kb KB result.  It exceeds the worker inline budget so it is\n\
+      # externalized, then the drive resolves it inline into state (refs_in_state\n\
+      # false) — so the NEXT command's render_context embeds the full blob and\n\
+      # exceeds NOETL_COMMAND_CONTEXT_MAX_BYTES, exercising the #114 offload.\n\
+      result = {\n    \"status\": \"success\",\n    \"size_kb\": kb,\n    \"blob\"\
+      : \"x\" * (kb * 1024),\n}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: consume
+- step: consume
+  tool:
+  - name: check
+    kind: python
+    input:
+      size_kb: '{{ start.size_kb }}'
+    code: "# Reads only a small scalar from the large upstream context — no _ref,\n\
+      # no lazy-load.  Reaching here proves the oversized command.issued event was\n\
+      # offloaded + resolved (the worker received the full context) under the\n\
+      # publish-only gate without wedging on the NATS payload wall.\n\
+      result = {\n    \"status\": \"success\",\n    \"verified_size_kb\": size_kb,\n}\n"
