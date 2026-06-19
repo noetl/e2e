@@ -60,3 +60,41 @@ scripts/kind_validate_orchestrate_offserver.sh --context kind-noetl
 
 Exit `0` = PASS; `1` = a hard assertion failed (dumps server + both worker
 pools' logs); `2` = precondition error (missing CLI / server unreachable).
+
+### Off-server drive under the CQRS PUBLISH_ONLY gate
+
+`scripts/kind_validate_orchestrate_gate.sh` proves the off-server drive
+composes with the CQRS write-path gate — the combination
+[noetl/ai-meta#103](https://github.com/noetl/ai-meta/issues/103) left
+unproven (gate-on was only ever validated with the in-process drive) and
+the [noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104)
+off-server-drive × gate reconciliation. It requires the server with
+`NOETL_EVENT_INGEST_PUBLISH_ONLY=true` **and**
+`NOETL_ORCHESTRATE_PLUGIN_DRIVE=true`, and the system pool with
+`NOETL_MATERIALIZER_ENABLED=true` (the in-process materializer loop is the
+sole `noetl.event` writer). On a **clean** cluster it runs the fan-out
+fixture and asserts:
+
+- Final status `COMPLETED` — read-your-writes held: the relocated trigger
+  fires from the materializer's write endpoint *after* the row lands, so the
+  server rebuilds `WorkflowState` from committed state before bounding the
+  off-server drive input.
+- The server **published** the run's events instead of inserting them
+  (`noetl_event_ingest_published_total` advanced by ≥ the run's event count).
+- Materializer is the **sole writer**, no loss / no double-write: the
+  `noetl.event` row count equals the distinct-`event_id` count.
+- Zero events with `catalog_id = 0` (the `get_catalog_id` `noetl.command`
+  fallback under the gate works — server#236).
+- Off-server topology under the gate: `0` `__orchestrate__` rows in
+  `noetl.event`, `>0` in `noetl.command`.
+- Drive metric: `dispatched` + `applied` advanced; `decode_error` and
+  `cold_rebuild_failed` did not.
+- The materializer reported `duplicates=0` across the run.
+
+```bash
+# clean the cluster first (truncate execution-state tables, purge noetl_events)
+# then, with the gate + drive + materializer env on, reachable at localhost:8082:
+scripts/kind_validate_orchestrate_gate.sh --context kind-noetl
+```
+
+Exit codes match the rig above.
