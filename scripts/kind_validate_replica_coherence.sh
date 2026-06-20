@@ -49,6 +49,11 @@
 #   5. Chain integrity per exec across replicas: exactly 1 root (prev_event_id
 #      NULL), no dangling prev pointer, the head-walk reaches every row (a single
 #      unforked chain — the property the head CAS guarantees).
+#   6. Exactly one terminal event per exec (noetl/ai-meta#118) — the
+#      duplicate-finalize suppression invariant.  A straggler/duplicate drive
+#      under off-server + PUBLISH_ONLY materializer-lag on a single replica used
+#      to emit a SECOND playbook.completed that orphaned the chain as a NULL-prev
+#      second root; the chokepoint FinalizedGuard now suppresses it.  Always HARD.
 #
 # noetl/ai-meta#117 — the off-server spine is replayed in prev_event_id CHAIN
 # order (walked from the server's ChainHeads tip = expected_head), not event_id
@@ -449,6 +454,13 @@ for eid in "${EIDS[@]}"; do
   TOTAL="$(count_rows "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $eid")"
   DISTINCT="$(count_rows "SELECT COUNT(DISTINCT event_id) AS n FROM noetl.event WHERE execution_id = $eid")"
   ROOTS="$(count_rows "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $eid AND prev_event_id IS NULL")"
+  # noetl/ai-meta#118: exactly one terminal event per execution.  A duplicate
+  # finalize (a straggler/duplicate drive under off-server + PUBLISH_ONLY
+  # materializer-lag on a single replica) used to emit a SECOND
+  # playbook.completed that — finding the chain head already evicted — orphaned
+  # as a NULL-prev second root.  The chokepoint's FinalizedGuard now suppresses
+  # the duplicate, so terminal count must be exactly 1 (and ROOTS must be 1).
+  TERMINALS="$(count_rows "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $eid AND event_type IN ('playbook.completed','playbook_completed','playbook.failed','playbook_failed','playbook.cancelled','playbook_cancelled')")"
   # Dangling: a non-null prev_event_id that points at no row in the same exec.
   DANGLING="$(count_rows "SELECT COUNT(*) AS n FROM noetl.event e WHERE e.execution_id = $eid AND e.prev_event_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM noetl.event p WHERE p.execution_id = $eid AND p.event_id = e.prev_event_id)")"
   # Recursive head-walk: how many rows the prev_event_id chain reaches from the
@@ -465,7 +477,7 @@ for eid in "${EIDS[@]}"; do
       JOIN walk w ON e.execution_id = $eid AND e.event_id = w.prev_event_id
     ) SELECT COUNT(*) AS n FROM walk")"
 
-  echo "kind-val: exec $eid — rows=$TOTAL distinct=$DISTINCT roots=$ROOTS dangling=$DANGLING walk=$WALK orch_events=$ORCH_EV"
+  echo "kind-val: exec $eid — rows=$TOTAL distinct=$DISTINCT roots=$ROOTS dangling=$DANGLING walk=$WALK terminals=$TERMINALS orch_events=$ORCH_EV"
 
   # Sole-writer invariants hold regardless of replica count (materializer +
   # drive suppression) → always HARD.
@@ -473,6 +485,11 @@ for eid in "${EIDS[@]}"; do
     || fail "exec $eid wrote $ORCH_EV __orchestrate__ rows to noetl.event (expected 0 — sole-writer / drive-suppression)"
   [[ "$TOTAL" -gt 0 && "$TOTAL" == "$DISTINCT" ]] \
     || fail "exec $eid sole-writer breach: rows=$TOTAL distinct=$DISTINCT (duplicate event_id under the gate)"
+  # Exactly one terminal event (noetl/ai-meta#118) — the duplicate-finalize
+  # suppression invariant.  Always HARD: a second terminal is a write-path defect
+  # regardless of replica count (multi-replica affinity also yields exactly 1).
+  [[ "$TERMINALS" == "1" ]] \
+    || fail "exec $eid has $TERMINALS terminal events (expected exactly 1 — a duplicate finalize; the chokepoint FinalizedGuard should suppress it, noetl/ai-meta#118)"
   # Chain-ordering integrity is the write-ordering property execution-affinity
   # owns → HARD single-replica / affinity-shipped, STAGED on 2+ replicas without
   # it (concurrent cross-replica emits fork the chain).
