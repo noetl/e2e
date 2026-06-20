@@ -229,6 +229,7 @@ assert_sole_writer() {  # execution_id label
 SM_BEFORE="$(fetch_server_metrics)"
 HP_SCAN_BEFORE="$(metric_label "$SM_BEFORE" noetl_event_hotpath_reads_total scan)"
 HP_DESC_BEFORE="$(metric_label "$SM_BEFORE" noetl_event_hotpath_reads_total served_descriptor)"
+HP_CMD_BEFORE="$(metric_label "$SM_BEFORE" noetl_event_hotpath_reads_total served_command)"
 SB_BUILD_BEFORE="$(metric_simple "$SM_BEFORE" noetl_state_build_total)"
 SB_SCAN_BEFORE="$(metric_simple "$SM_BEFORE" noetl_state_build_event_scans_total)"
 
@@ -265,10 +266,11 @@ assert_sole_writer "$FO_EID" fanout
 SM_AFTER="$(fetch_server_metrics)"
 HP_SCAN_D=$(( $(metric_label "$SM_AFTER" noetl_event_hotpath_reads_total scan) - HP_SCAN_BEFORE ))
 HP_DESC_D=$(( $(metric_label "$SM_AFTER" noetl_event_hotpath_reads_total served_descriptor) - HP_DESC_BEFORE ))
+HP_CMD_D=$(( $(metric_label "$SM_AFTER" noetl_event_hotpath_reads_total served_command) - HP_CMD_BEFORE ))
 SB_BUILD_D=$(( $(metric_simple "$SM_AFTER" noetl_state_build_total) - SB_BUILD_BEFORE ))
 SB_SCAN_D=$(( $(metric_simple "$SM_AFTER" noetl_state_build_event_scans_total) - SB_SCAN_BEFORE ))
 echo
-echo "kind-val: hot-path reads — served_descriptor=+$HP_DESC_D scan=+$HP_SCAN_D (want scan 0, descriptor >=1)"
+echo "kind-val: hot-path reads — served_descriptor=+$HP_DESC_D served_command=+$HP_CMD_D scan=+$HP_SCAN_D (want scan 0, descriptor >=1)"
 echo "kind-val: drive path — state_build_total=+$SB_BUILD_D state_build_event_scans=+$SB_SCAN_D (want both 0)"
 
 # ======================================================================
@@ -278,15 +280,17 @@ echo
 echo "kind-val: audit check — noetl.event readable by operator/status/replay APIs"
 AUDIT_ROWS="$(count_rows "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $FO_EID")"
 AUDIT_STATUS="$(noetl status "$FO_EID" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' || true)"
-REPLAY_N="$(curl -fsS "$NOETL_SERVER_URL/api/executions/$FO_EID/replay" 2>/dev/null \
+# Replay folds the execution's events from noetl.event — an AUDIT/operator read
+# (GET /api/replay/state), exactly the consumer that legitimately keeps reading
+# the table.  event_count is the number of noetl.event rows it folded.
+REPLAY_N="$(curl -fsS "$NOETL_SERVER_URL/api/replay/state?execution_id=$FO_EID" 2>/dev/null \
   | python3 -c 'import json,sys
 try:
     d=json.load(sys.stdin)
 except Exception:
     print(0); raise SystemExit
-ev=d.get("events", d if isinstance(d, list) else [])
-print(len(ev) if isinstance(ev, list) else 0)' || echo 0)"
-echo "kind-val: audit — direct noetl.event rows=$AUDIT_ROWS, status API=$AUDIT_STATUS, replay events=$REPLAY_N"
+print(d.get("event_count", 0) if isinstance(d, dict) else 0)' || echo 0)"
+echo "kind-val: audit — direct noetl.event rows=$AUDIT_ROWS, status API=$AUDIT_STATUS, replay event_count=$REPLAY_N"
 
 # ======================================================================
 # Materializer duplicates (sole-writer health) over the whole batch.
@@ -296,8 +300,11 @@ MAT_DUP_HITS="$("${KCTX[@]}" logs deploy/"$NOETL_SYSTEM_POOL_DEPLOY" --tail=1200
 # ======================================================================
 # Assertions.
 # ======================================================================
-# 1. NEVER-SCAN on the ingest/callback/execute path.
-[[ "$HP_SCAN_D" -eq 0 ]] || fail "hot-path event SCANS advanced (+$HP_SCAN_D) — a lifecycle reader scanned noetl.event instead of the descriptor"
+# 1. NEVER-SCAN on the ingest/callback/execute path.  Every hot-path reader is
+#    served from the in-memory descriptor (live lifecycle) or, on a cold
+#    descriptor (post-terminal straggler after eviction / restart), from the
+#    synchronous noetl.command queue — NEVER from a noetl.event scan.
+[[ "$HP_SCAN_D" -eq 0 ]] || fail "hot-path event SCANS advanced (+$HP_SCAN_D) — a lifecycle reader scanned noetl.event instead of the descriptor/command queue"
 [[ "$HP_DESC_D" -ge 1 ]] || fail "hot-path descriptor reads did not advance (+$HP_DESC_D) — the audit_only path was not exercised (vacuous proof)"
 # 2. NEVER-SCAN on the drive path (Phase-4 stateless edge).
 [[ "$SB_BUILD_D" -eq 0 ]] || fail "drive state_build_total advanced (+$SB_BUILD_D) — the drive rebuilt WorkflowState (not a stateless edge)"
@@ -313,7 +320,7 @@ echo
 if [[ "$OVERALL" -eq 0 ]]; then
   echo "================================================================"
   echo "kind-val: PASS — END-TO-END never-scan invariant under audit_only + offserver"
-  echo "  1. ingest/callback/execute path scan-free: hotpath scan +$HP_SCAN_D (served_descriptor +$HP_DESC_D)"
+  echo "  1. ingest/callback/execute path scan-free: hotpath scan +$HP_SCAN_D (served_descriptor +$HP_DESC_D, served_command +$HP_CMD_D)"
   echo "  2. drive path scan-free: state_build_total +$SB_BUILD_D, state_build_event_scans +$SB_SCAN_D"
   echo "     => ZERO noetl.event scans anywhere on the hot path, end-to-end"
   echo "  3. COMPLETE: linear/loop/fanout all COMPLETED"
