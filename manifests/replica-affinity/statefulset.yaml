@@ -1,0 +1,142 @@
+# Multi-replica execution-affinity topology (RFC noetl/ai-meta#116).
+#
+# The single-replica kind baseline runs noetl-server-rust as a Deployment. To
+# validate execution-affinity write ordering we need 2 server replicas, each with
+# a DISTINCT shard index, individually addressable so a non-owner can forward an
+# /api/events POST to the owner. A StatefulSet gives exactly that:
+#
+#   - stable ordinal pod names noetl-server-rust-0 / -1, so
+#     NOETL_SHARD_INDEX_FROM_HOSTNAME derives shard_index 0 / 1 from one manifest
+#     with identical env (no per-pod env templating);
+#   - per-pod DNS via the headless service below, so
+#     NOETL_PEER_URL_TEMPLATE = http://noetl-server-rust-{shard}.noetl-server-rust-headless...
+#     resolves the owner replica directly;
+#   - NOETL_SERVER_MACHINE_ID is OMITTED so each pod derives a distinct snowflake
+#     machine_id from its hostname (a fixed id would collide across the 2 pods).
+#
+# The cluster `noetl` Service (selector app=noetl-server-rust) load-balances
+# across both pods, so a worker's command.completed lands on either replica and is
+# forwarded to the owner — exactly the cross-replica interleave that forks the
+# chain without affinity.
+#
+# Apply / tear down via scripts/deploy_replica_affinity_topology.sh (it scales the
+# baseline Deployment to 0 first and restores it after). __IMAGE__ is substituted
+# by that helper with the locally-built, kind-loaded server image.
+apiVersion: v1
+kind: Service
+metadata:
+  name: noetl-server-rust-headless
+  namespace: noetl
+  labels:
+    app: noetl-server-rust
+    noetl.io/topology: replica-affinity
+spec:
+  clusterIP: None
+  selector:
+    app: noetl-server-rust
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: noetl-server-rust
+  namespace: noetl
+  labels:
+    app: noetl-server-rust
+    noetl.io/topology: replica-affinity
+spec:
+  serviceName: noetl-server-rust-headless
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: noetl-server-rust
+  template:
+    metadata:
+      labels:
+        app: noetl-server-rust
+        noetl.io/topology: replica-affinity
+    spec:
+      containers:
+        - name: noetl-server
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+              name: http
+          env:
+            - name: NOETL_HOST
+              value: "0.0.0.0"
+            - name: NOETL_PORT
+              value: "8082"
+            - name: RUST_LOG
+              value: info,noetl_server=debug,sqlx=warn
+            - name: POSTGRES_HOST
+              value: postgres.postgres.svc.cluster.local
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: noetl
+            - name: POSTGRES_PASSWORD
+              value: noetl
+            - name: POSTGRES_DATABASE
+              value: noetl
+            - name: NOETL_SCHEMA
+              value: noetl
+            - name: NOETL_NATS_URL
+              value: nats://noetl:noetl@nats.nats.svc.cluster.local:4222
+            - name: NOETL_PUBLIC_SERVER_URL
+              value: http://noetl.noetl.svc.cluster.local:8082
+            - name: NOETL_INTERNAL_API_TOKEN
+              value: 8f9d6a1427e7c2b9a36f9b8c7dde8ec821a409c086cf60ead290a520a71d87fc
+            - name: NOETL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: NOETL_ENCRYPTION_KEY
+                  name: noetl-secret
+            - name: NOETL_ALLOW_INSECURE_DEFAULT_KEY
+              value: "true"
+            # Off-server gate stack (matches the single-replica coherence run).
+            - name: NOETL_ORCHESTRATE_PLUGIN_SHADOW
+              value: "false"
+            - name: NOETL_ORCHESTRATE_PLUGIN_DRIVE
+              value: "true"
+            - name: NOETL_EVENT_INGEST_PUBLISH_ONLY
+              value: "true"
+            - name: NOETL_STATE_BUILDER
+              value: "offserver"
+            - name: NOETL_STATE_BUILD_MODE
+              value: "event_scan"
+            # audit_only retires the hot-path noetl.event read class (#115 Phase
+            # 6) so the rig's never-scan assertion holds; cold reads serve from
+            # the KV-coherent descriptor / noetl.command, never a scan.
+            - name: NOETL_EVENT_READ_PATH
+              value: "audit_only"
+            # Multi-replica coherence DATA layer (#115, v3.38.0).
+            - name: NOETL_REPLICA_COHERENCE
+              value: "nats_kv"
+            # Execution-affinity WRITE-ORDERING (#116).
+            - name: NOETL_EXECUTION_AFFINITY
+              value: "true"
+            - name: NOETL_SHARD_COUNT
+              value: "2"
+            - name: NOETL_SHARD_INDEX_FROM_HOSTNAME
+              value: "true"
+            - name: NOETL_PEER_URL_TEMPLATE
+              value: http://noetl-server-rust-{shard}.noetl-server-rust-headless.noetl.svc.cluster.local:8082
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8082
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
