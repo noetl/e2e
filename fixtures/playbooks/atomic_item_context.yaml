@@ -1,0 +1,82 @@
+# NoETL Canonical v10 Playbook
+#
+# RFC noetl/ai-meta#115 Phase 5 — atomic-working-item context contract (tenet 6).
+#
+# Proves the minimal-slice property: a downstream step that binds exactly ONE
+# upstream step's output must receive ONLY that upstream key in its worker-bound
+# command context — not the other upstream outputs accumulated so far.
+#
+# Chain: start -> producer_a -> producer_b -> consumer -> end
+#   - producer_a emits a distinctive tag "AAA_KEEP".
+#   - producer_b emits a distinctive tag "BBB_DROP" (must NOT reach consumer).
+#   - consumer binds ONLY `{{ producer_a.tag }}` (bare step-name form, per the
+#     explicit input-binding surface #77 shipped).
+#
+# With NOETL_ATOMIC_ITEM_CONTEXT=true the consumer's persisted `command.issued`
+# context contains `producer_a` and NOT `producer_b`.  With the flag off
+# (default) it carries the full accumulated context (back-compat).
+
+apiVersion: noetl.io/v2
+kind: Playbook
+
+metadata:
+  name: atomic_item_context
+  path: test/atomic_item_context
+  description: Phase 5 minimal-slice proof — consumer binds only producer_a
+
+workflow:
+  - step: start
+    tool:
+      kind: python
+      code: |
+        result = {"status": "started"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: producer_a
+
+  - step: producer_a
+    desc: Emit a distinctive value the consumer WILL bind.
+    tool:
+      kind: python
+      code: |
+        result = {"tag": "AAA_KEEP"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: producer_b
+
+  - step: producer_b
+    desc: Emit a distinctive value the consumer will NOT bind (must be dropped).
+    tool:
+      kind: python
+      code: |
+        result = {"tag": "BBB_DROP"}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: consumer
+
+  - step: consumer
+    desc: Bind ONLY producer_a — its context slice must exclude producer_b.
+    tool:
+      kind: python
+      input:
+        only_a: "{{ producer_a.tag }}"
+      code: |
+        result = {"consumed": only_a}
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: end
+
+  - step: end
+    desc: Workflow complete
+    tool:
+      kind: python
+      code: |
+        result = {"status": "completed"}
