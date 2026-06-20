@@ -115,28 +115,39 @@ echo "kind-val: env — PUBLISH_ONLY=$GATE_ON PLUGIN_DRIVE=$DRIVE_ON MATERIALIZE
 [[ "$DRIVE_ON" != "false" ]] || { echo "kind-val: PLUGIN_DRIVE=false — this rig requires the off-server drive." >&2; exit 2; }
 [[ "$MAT_ON" == "true" ]] || { echo "kind-val: MATERIALIZER_ENABLED not true — no sole writer." >&2; exit 2; }
 
-# Record originals + restore on exit.
+# Record originals + restore on exit.  NOETL_STATE_BUILDER must be set on BOTH
+# the server (it marks the orchestrate command `__offserver_build__`) AND the
+# system pool (its drain is authoritative + dispatch_wasm builds from the WAL).
 ORIG_SB="$(get_env "$NOETL_SYSTEM_POOL_DEPLOY" NOETL_STATE_BUILDER)"
+ORIG_SB_SRV="$(get_env "$NOETL_SERVER_DEPLOY" NOETL_STATE_BUILDER)"
 ORIG_SM="$(get_env "$NOETL_SERVER_DEPLOY" NOETL_STATE_BUILD_MODE)"
 PF_PID=""
 cleanup() {
   [[ -n "$PF_PID" ]] && kill "$PF_PID" >/dev/null 2>&1 || true
   if [[ "$RESTORE" -eq 1 ]]; then
-    echo "kind-val: restoring baseline (NOETL_STATE_BUILDER=${ORIG_SB:-server}, NOETL_STATE_BUILD_MODE=${ORIG_SM:-event_scan})"
+    echo "kind-val: restoring baseline (STATE_BUILDER pool=${ORIG_SB:-server}/server=${ORIG_SB_SRV:-server}, STATE_BUILD_MODE=${ORIG_SM:-event_scan})"
     "${KCTX[@]}" set env deploy/"$NOETL_SYSTEM_POOL_DEPLOY" "NOETL_STATE_BUILDER=${ORIG_SB:-server}" >/dev/null 2>&1 || true
-    "${KCTX[@]}" set env deploy/"$NOETL_SERVER_DEPLOY" "NOETL_STATE_BUILD_MODE=${ORIG_SM:-event_scan}" >/dev/null 2>&1 || true
+    "${KCTX[@]}" set env deploy/"$NOETL_SERVER_DEPLOY" "NOETL_STATE_BUILDER=${ORIG_SB_SRV:-server}" "NOETL_STATE_BUILD_MODE=${ORIG_SM:-event_scan}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 set_state_builder() {  # offserver|server
-  echo "kind-val: setting NOETL_STATE_BUILDER=$1 (system pool) + NOETL_STATE_BUILD_MODE=chain_walk (server)"
+  echo "kind-val: setting NOETL_STATE_BUILDER=$1 (server + system pool) + NOETL_STATE_BUILD_MODE=chain_walk (server)"
   "${KCTX[@]}" set env deploy/"$NOETL_SYSTEM_POOL_DEPLOY" "NOETL_STATE_BUILDER=$1" >/dev/null
-  "${KCTX[@]}" set env deploy/"$NOETL_SERVER_DEPLOY" NOETL_STATE_BUILD_MODE=chain_walk >/dev/null
+  "${KCTX[@]}" set env deploy/"$NOETL_SERVER_DEPLOY" "NOETL_STATE_BUILDER=$1" NOETL_STATE_BUILD_MODE=chain_walk >/dev/null
   "${KCTX[@]}" rollout status deploy/"$NOETL_SYSTEM_POOL_DEPLOY" --timeout=120s >/dev/null
   "${KCTX[@]}" rollout status deploy/"$NOETL_SERVER_DEPLOY" --timeout=120s >/dev/null
+  # Wait for the freshly-rolled server to answer health through the
+  # port-forward (the rollout marks the pod Ready, but the PF may briefly route
+  # to the terminating pod) before any register/exec hits it.
+  local hdl=$(( SECONDS + 60 ))
+  until curl -fsS "$NOETL_SERVER_URL/api/health" >/dev/null 2>&1; do
+    [[ $SECONDS -lt $hdl ]] || { echo "kind-val: server health not ready after rollout" >&2; break; }
+    sleep 2
+  done
   # Let the authoritative WAL drain warm its index off the retained stream.
-  sleep 6
+  sleep 8
 }
 
 # ----------------------------------------------------------------------
@@ -195,22 +206,23 @@ d=json.loads(sys.stdin.read() or "{}").get("result", [])
 print(",".join("%s:%s" % (r.get("nn"), r.get("c")) for r in sorted(d, key=lambda r: str(r.get("nn")))))'
 }
 
-run_leg() {  # label -> echoes EXECUTION_ID; sets FINAL_STATUS
-  local label="$1"
+# Runs one execution leg.  Sets globals LEG_EID + LEG_STATUS (called WITHOUT
+# command substitution so the globals propagate — a `$(run_leg)` subshell would
+# discard them).
+run_leg() {  # label
   noetl register playbook --file "$FIXTURE_PATH" >/dev/null
-  local eid
-  eid="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
+  LEG_EID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
+  echo "kind-val: $1 leg launched execution_id=$LEG_EID"
   local deadline=$(( SECONDS + TIMEOUT_SECS ))
-  FINAL_STATUS=""
+  LEG_STATUS=""
   while [[ $SECONDS -lt $deadline ]]; do
-    FINAL_STATUS="$(noetl status "$eid" --json 2>/dev/null \
+    LEG_STATUS="$(noetl status "$LEG_EID" --json 2>/dev/null \
       | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' || true)"
-    case "$FINAL_STATUS" in COMPLETED|FAILED) break ;; esac
+    case "$LEG_STATUS" in COMPLETED|FAILED) break ;; esac
     sleep 2
   done
   sleep 4  # let the materializer flush terminal events
-  echo "$eid"
 }
 
 OVERALL=0
@@ -235,7 +247,7 @@ W_WAL_BEFORE="$(metric_simple "$WM_BEFORE" noetl_worker_state_builder_wal_events
 W_COLD_BEFORE="$(metric_label "$WM_BEFORE" noetl_worker_state_builder_builds_total cold_rebuild)"
 W_INCR_BEFORE="$(metric_label "$WM_BEFORE" noetl_worker_state_builder_builds_total incremental)"
 
-OFF_EID="$(run_leg offserver)"; OFF_STATUS="$FINAL_STATUS"
+run_leg offserver; OFF_EID="$LEG_EID"; OFF_STATUS="$LEG_STATUS"
 echo "kind-val: offserver leg execution_id=$OFF_EID final_status=$OFF_STATUS"
 
 SB_SCAN_AFTER="$(metric_simple "$(fetch_server_metrics)" noetl_state_build_event_scans_total)"
@@ -268,7 +280,7 @@ echo "================================================================"
 echo "kind-val: LEG 2 — NOETL_STATE_BUILDER=server (parity baseline)"
 echo "================================================================"
 set_state_builder server
-SRV_EID="$(run_leg server)"; SRV_STATUS="$FINAL_STATUS"
+run_leg server; SRV_EID="$LEG_EID"; SRV_STATUS="$LEG_STATUS"
 SRV_FP="$(fingerprint "$SRV_EID")"
 echo "kind-val: server leg execution_id=$SRV_EID final_status=$SRV_STATUS"
 echo "kind-val: server fingerprint = [$SRV_FP]"
