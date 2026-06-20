@@ -16,16 +16,21 @@
 # server-built cold-fallback scan happens just because a trigger landed on a
 # replica that didn't seed the execution.
 #
-# SHIPPED vs STAGED: the KV data-coherence layer (head + descriptor) is shipped
-# and proven — single-replica nats_kv is bit-for-bit parity with local (all
-# topologies COMPLETE, clean chains), and on 2+ replicas the cross-replica
-# resolves provably happen (kv_remote_hit advances).  The multi-replica
-# WRITE-ORDERING piece — execution-affinity (one replica owns an execution's
-# drive + chain write) — is STAGED: without it, concurrent cross-replica emits
-# fork the chain, so executions do not yet reliably COMPLETE on 2+ replicas.
-# Until it lands, the COMPLETION + chain-integrity checks are reported (not
-# hard-failed) on 2+ replicas; the coherence-resolve proof + sole-writer stay
-# HARD.  Flip NOETL_COHERENCE_DRIVE_AFFINITY=shipped to make them HARD again.
+# TWO LAYERS, both now shipped:
+#   1. KV data-coherence (head + descriptor) — NOETL_REPLICA_COHERENCE=nats_kv
+#      (noetl/server#251, v3.38.0).  Makes any replica resolve the same
+#      watermark/descriptor.  Necessary but not sufficient.
+#   2. Execution-affinity write-ordering — NOETL_EXECUTION_AFFINITY=true
+#      (RFC noetl/ai-meta#116).  Routes every trigger for an execution to the
+#      single replica that owns shard_for(execution_id), so the off-server
+#      chain head's read→advance is atomic per execution and the chain never
+#      forks across replicas.  This is what makes executions COMPLETE reliably
+#      on 2+ replicas.
+#
+# Until affinity landed, the COMPLETION + chain-integrity checks were reported
+# (not hard-failed) on 2+ replicas.  With it shipped, flip
+# NOETL_COHERENCE_DRIVE_AFFINITY=shipped to make them HARD again (and to assert
+# the forwarded_ok proof series advanced).
 #
 # What it asserts (gate ON: PUBLISH_ONLY + offserver + materializer sole-writer
 # + replica_coherence=nats_kv, server replicas >= 2):
@@ -94,26 +99,59 @@ for cmd in kubectl noetl curl python3; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "kind-val: required command not in PATH: $cmd" >&2; exit 2; }
 done
 
-if ! "${KCTX[@]}" get deployment "$NOETL_SERVER_DEPLOY" >/dev/null 2>&1; then
-  echo "kind-val: $NOETL_SERVER_DEPLOY Deployment not found in namespace $NAMESPACE." >&2; exit 2
+# The server workload is a Deployment for the single-replica topology and a
+# StatefulSet for the multi-replica execution-affinity topology (RFC
+# noetl/ai-meta#116 — stable ordinal hostnames give each pod a distinct
+# NOETL_SHARD_INDEX via NOETL_SHARD_INDEX_FROM_HOSTNAME, and the headless service
+# lets a non-owner forward to the owner).  Auto-detect; override with
+# NOETL_SERVER_WORKLOAD_KIND=deployment|statefulset.
+ready_replicas_of() {
+  # $1 = deployment|statefulset → prints readyReplicas (0 if absent/none).
+  local kind="$1" n
+  n="$("${KCTX[@]}" get "$kind" "$NOETL_SERVER_DEPLOY" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
+  echo "${n:-0}"
+}
+SERVER_WORKLOAD_KIND="${NOETL_SERVER_WORKLOAD_KIND:-}"
+if [[ -z "$SERVER_WORKLOAD_KIND" ]]; then
+  # The affinity topology runs the StatefulSet while the baseline Deployment of
+  # the same name is scaled to 0 (the topology helper doesn't delete it). Prefer
+  # whichever workload actually has ready replicas so we don't read the dormant
+  # one's metadata; fall back to existence (StatefulSet first, since that's the
+  # multi-replica topology this rig targets).
+  DEP_READY="$(ready_replicas_of deployment)"
+  STS_READY="$(ready_replicas_of statefulset)"
+  if [[ "$STS_READY" -gt 0 ]]; then
+    SERVER_WORKLOAD_KIND="statefulset"
+  elif [[ "$DEP_READY" -gt 0 ]]; then
+    SERVER_WORKLOAD_KIND="deployment"
+  elif "${KCTX[@]}" get statefulset "$NOETL_SERVER_DEPLOY" >/dev/null 2>&1; then
+    SERVER_WORKLOAD_KIND="statefulset"
+  elif "${KCTX[@]}" get deployment "$NOETL_SERVER_DEPLOY" >/dev/null 2>&1; then
+    SERVER_WORKLOAD_KIND="deployment"
+  fi
 fi
+if [[ -z "$SERVER_WORKLOAD_KIND" ]]; then
+  echo "kind-val: $NOETL_SERVER_DEPLOY not found as a Deployment or StatefulSet in namespace $NAMESPACE." >&2; exit 2
+fi
+SERVER_WORKLOAD="$SERVER_WORKLOAD_KIND/$NOETL_SERVER_DEPLOY"
 if ! curl -fsS "$NOETL_SERVER_URL/api/health" >/dev/null 2>&1; then
   echo "kind-val: server not reachable at $NOETL_SERVER_URL/api/health — start a port-forward first." >&2; exit 2
 fi
 
 # Detected server config + replica count (informational + soft preconditions).
 get_env() {
-  "${KCTX[@]}" get deployment "$NOETL_SERVER_DEPLOY" \
+  "${KCTX[@]}" get "$SERVER_WORKLOAD" \
     -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='$1')]}{.value}{end}" 2>/dev/null
 }
-REPLICAS="$("${KCTX[@]}" get deployment "$NOETL_SERVER_DEPLOY" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
+REPLICAS="$("${KCTX[@]}" get "$SERVER_WORKLOAD" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
 REPLICAS="${REPLICAS:-0}"
 COHERENCE_MODE="$(get_env NOETL_REPLICA_COHERENCE)"; COHERENCE_MODE="${COHERENCE_MODE:-local}"
+AFFINITY_MODE="$(get_env NOETL_EXECUTION_AFFINITY)"; AFFINITY_MODE="${AFFINITY_MODE:-false}"
 STATE_BUILDER="$(get_env NOETL_STATE_BUILDER)"; STATE_BUILDER="${STATE_BUILDER:-server}"
 PUBLISH_ONLY="$(get_env NOETL_EVENT_INGEST_PUBLISH_ONLY)"; PUBLISH_ONLY="${PUBLISH_ONLY:-false}"
 
 echo "kind-val: context=$KIND_CONTEXT namespace=$NAMESPACE server=$NOETL_SERVER_URL"
-echo "kind-val: server replicas(ready)=$REPLICAS  replica_coherence=$COHERENCE_MODE  state_builder=$STATE_BUILDER  publish_only=$PUBLISH_ONLY"
+echo "kind-val: server workload=$SERVER_WORKLOAD replicas(ready)=$REPLICAS  replica_coherence=$COHERENCE_MODE  execution_affinity=$AFFINITY_MODE  state_builder=$STATE_BUILDER  publish_only=$PUBLISH_ONLY"
 echo "kind-val: runs per topology=$RUNS_PER_TOPOLOGY"
 
 # The KV data-coherence layer (head + descriptor) is SHIPPED.  The multi-replica
@@ -126,14 +164,33 @@ echo "kind-val: runs per topology=$RUNS_PER_TOPOLOGY"
 # shipped once execution-affinity is in to flip them back to HARD.
 AFFINITY_SHIPPED="${NOETL_COHERENCE_DRIVE_AFFINITY:-staged}"
 
+AFFINITY_ACTIVE="false"
+if [[ "$REPLICAS" -ge 2 && "$AFFINITY_MODE" == "true" && "$AFFINITY_SHIPPED" == "shipped" ]]; then
+  AFFINITY_ACTIVE="true"
+fi
+
 EXPECT_REMOTE_HIT="false"
 COMPLETION_HARD="true"
 if [[ "$REPLICAS" -ge 2 && "$COHERENCE_MODE" == "nats_kv" ]]; then
-  EXPECT_REMOTE_HIT="true"
-  echo "kind-val: multi-replica + nats_kv → cross-replica resolves (kv_remote_hit) are a HARD assertion"
-  if [[ "$AFFINITY_SHIPPED" != "shipped" ]]; then
-    COMPLETION_HARD="false"
-    echo "kind-val: NOTE — execution-affinity STAGED → multi-replica COMPLETION + chain-integrity are reported, not hard-failed (set NOETL_COHERENCE_DRIVE_AFFINITY=shipped once it lands)"
+  if [[ "$AFFINITY_ACTIVE" == "true" ]]; then
+    # Execution-affinity (RFC noetl/ai-meta#116) routes EVERY trigger for an
+    # execution to its owner, which resolves the head/descriptor from its LOCAL
+    # in-process write-through cache — so cross-replica KV resolves
+    # (kv_remote_hit) trend to ZERO BY DESIGN (KV becomes the handoff-only
+    # vehicle on ownership change).  The multi-replica proof under affinity is
+    # `forwarded_ok` (non-owner→owner forwards), asserted HARD below; so
+    # kv_remote_hit is informational here, not a hard failure.
+    EXPECT_REMOTE_HIT="false"
+    echo "kind-val: execution-affinity ACTIVE → owner resolves LOCAL; kv_remote_hit is informational (forwarded_ok is the HARD multi-replica proof, RFC #116)"
+  else
+    # DATA-layer-only coherence run (no affinity): triggers land on non-seeding
+    # replicas and MUST resolve from KV → kv_remote_hit is the HARD proof.
+    EXPECT_REMOTE_HIT="true"
+    echo "kind-val: multi-replica + nats_kv (no affinity) → cross-replica resolves (kv_remote_hit) are a HARD assertion"
+    if [[ "$AFFINITY_SHIPPED" != "shipped" ]]; then
+      COMPLETION_HARD="false"
+      echo "kind-val: NOTE — execution-affinity STAGED → multi-replica COMPLETION + chain-integrity are reported, not hard-failed (set NOETL_COHERENCE_DRIVE_AFFINITY=shipped once it lands)"
+    fi
   fi
 else
   echo "kind-val: NOTE — replicas<2 or coherence!=nats_kv → kv_remote_hit is informational this run"
@@ -183,6 +240,23 @@ for line in sys.stdin:
     if m: total += int(float(m.group(1)))
 print(total)
 ' "$name"
+}
+
+# noetl_execution_affinity_total summed over a given outcome (RFC #116).
+affinity_outcome() {
+  local outcome="$1" body="$2"
+  printf '%s' "$body" | python3 -c '
+import re, sys
+want = sys.argv[1]
+total = 0
+for line in sys.stdin:
+    m = re.match(r"noetl_execution_affinity_total\{([^}]*)\}\s+([0-9.]+)", line)
+    if not m: continue
+    lm = dict(re.findall(r"(\w+)=\"([^\"]*)\"", m.group(1)))
+    if lm.get("outcome") == want:
+        total += int(float(m.group(2)))
+print(total)
+' "$outcome"
 }
 
 # noetl_event_hotpath_reads_total summed over a given outcome.
@@ -244,6 +318,8 @@ LOCALHIT_BEFORE="$(coherence_outcome kv_local_hit "$M_BEFORE")"
 UNAVAIL_BEFORE="$(coherence_outcome kv_unavailable "$M_BEFORE")"
 SCAN_BUILD_BEFORE="$(counter_value noetl_state_build_event_scans_total "$M_BEFORE")"
 HOTPATH_SCAN_BEFORE="$(hotpath_outcome scan "$M_BEFORE")"
+FORWARD_BEFORE="$(affinity_outcome forwarded_ok "$M_BEFORE")"
+AFF_DEGRADE_BEFORE="$(( $(affinity_outcome forward_unavailable "$M_BEFORE") + $(affinity_outcome forward_http_err "$M_BEFORE") + $(affinity_outcome forward_decode_err "$M_BEFORE") ))"
 
 EIDS=()
 for entry in "${FIXTURES[@]}"; do
@@ -274,12 +350,16 @@ LOCALHIT_AFTER="$(coherence_outcome kv_local_hit "$M_AFTER")"
 UNAVAIL_AFTER="$(coherence_outcome kv_unavailable "$M_AFTER")"
 SCAN_BUILD_AFTER="$(counter_value noetl_state_build_event_scans_total "$M_AFTER")"
 HOTPATH_SCAN_AFTER="$(hotpath_outcome scan "$M_AFTER")"
+FORWARD_AFTER="$(affinity_outcome forwarded_ok "$M_AFTER")"
+AFF_DEGRADE_AFTER="$(( $(affinity_outcome forward_unavailable "$M_AFTER") + $(affinity_outcome forward_http_err "$M_AFTER") + $(affinity_outcome forward_decode_err "$M_AFTER") ))"
 
 REMOTE_DELTA=$(( REMOTE_AFTER - REMOTE_BEFORE ))
 LOCALHIT_DELTA=$(( LOCALHIT_AFTER - LOCALHIT_BEFORE ))
 UNAVAIL_DELTA=$(( UNAVAIL_AFTER - UNAVAIL_BEFORE ))
 SCAN_BUILD_DELTA=$(( SCAN_BUILD_AFTER - SCAN_BUILD_BEFORE ))
 HOTPATH_SCAN_DELTA=$(( HOTPATH_SCAN_AFTER - HOTPATH_SCAN_BEFORE ))
+FORWARD_DELTA=$(( FORWARD_AFTER - FORWARD_BEFORE ))
+AFF_DEGRADE_DELTA=$(( AFF_DEGRADE_AFTER - AFF_DEGRADE_BEFORE ))
 
 echo
 echo "================================================================"
@@ -289,6 +369,8 @@ echo "  kv_local_hit   +$LOCALHIT_DELTA"
 echo "  kv_unavailable +$UNAVAIL_DELTA  (degraded-to-local; should be 0 when NATS is healthy)"
 echo "  state_build_event_scans +$SCAN_BUILD_DELTA   (drive cold-fallback scans — must be 0)"
 echo "  hotpath scan            +$HOTPATH_SCAN_DELTA   (lifecycle cold-fallback scans — must be 0)"
+echo "  affinity forwarded_ok   +$FORWARD_DELTA   (RFC #116 — non-owner→owner forwards; >0 proves write-ordering routing)"
+echo "  affinity degraded       +$AFF_DEGRADE_DELTA   (forward failures → local fallback; should be 0 when healthy)"
 echo "================================================================"
 
 # ----------------------------------------------------------------------
@@ -301,6 +383,18 @@ if [[ "$EXPECT_REMOTE_HIT" == "true" ]]; then
     || fail "noetl_replica_coherence_total{outcome=kv_remote_hit} did not advance (+$REMOTE_DELTA) — with 2 replicas + nats_kv, triggers should land on a replica that did not seed the execution and resolve it from KV; no remote hit means coherence was never exercised (or all triggers happened to stay on the seeding replica)"
 else
   echo "kind-val: kv_remote_hit +$REMOTE_DELTA (informational — single replica or coherence!=nats_kv)"
+fi
+
+# 2b. Execution-affinity forwarding happened (RFC noetl/ai-meta#116) — the
+# write-ordering proof.  With affinity shipped + 2 replicas, a trigger landing on
+# a non-owner must forward to the owner; no forward across the whole run means
+# affinity routing never engaged (the single-owner property is what keeps the
+# chain from forking).
+if [[ "$AFFINITY_ACTIVE" == "true" ]]; then
+  [[ "$FORWARD_DELTA" -ge 1 ]] \
+    || fail "noetl_execution_affinity_total{outcome=forwarded_ok} did not advance (+$FORWARD_DELTA) — with 2 replicas + execution-affinity ON, triggers landing on a non-owner should forward to the owner; no forward means affinity routing never engaged (executions would fork without it)"
+  [[ "$AFF_DEGRADE_DELTA" -eq 0 ]] \
+    || echo "kind-val: WARN — affinity degraded to local +$AFF_DEGRADE_DELTA times (owner unreachable / non-success forward); write ordering held via KV but the owner path had transient failures" >&2
 fi
 
 # 3. No cold-fallback scans attributable to the replica split.
@@ -365,7 +459,7 @@ if [[ "$OVERALL" == "0" ]]; then
   echo "  executions COMPLETE=${#EIDS[@]} kv_remote_hit=+$REMOTE_DELTA build_scans=+$SCAN_BUILD_DELTA hotpath_scans=+$HOTPATH_SCAN_DELTA"
 else
   echo "kind-val: FAIL — see assertions above" >&2
-  echo "=== noetl-server-rust logs (tail) ===" >&2
-  "${KCTX[@]}" logs "deployment/$NOETL_SERVER_DEPLOY" --tail=80 2>/dev/null | tail -80 >&2 || true
+  echo "=== $SERVER_WORKLOAD logs (tail) ===" >&2
+  "${KCTX[@]}" logs "$SERVER_WORKLOAD" --tail=80 2>/dev/null | tail -80 >&2 || true
 fi
 exit "$OVERALL"
