@@ -22,10 +22,16 @@
 #      (the WAL spine, not the server-built state, drove the decision), and
 #      `noetl_worker_state_builder_event_scans_total` stayed 0 (the spine came
 #      from the WAL, zero noetl.event reads on the worker).
-#   C. NO SERVER REBUILD/SCAN ON THE DRIVE PATH — with the server in
-#      NOETL_STATE_BUILD_MODE=chain_walk, the server's
+#   C. NO SERVER REBUILD/SCAN ON THE DRIVE PATH — the server's
 #      `noetl_state_build_event_scans_total` delta is 0 (no WHERE execution_id
 #      scan of noetl.event drove this run).
+#   C2. STATELESS EDGE (RFC #115 Phase 4 remainder, noetl/ai-meta#107 step 2) —
+#      the server builds NO WorkflowState at all on the drive path:
+#      `noetl_state_build_total` delta is 0 (neither event_scan NOR chain_walk),
+#      while `noetl_orchestrate_drive_total{dispatched_offserver_stateless}` and
+#      `{applied_stateless}` advance (the server just routes the command +
+#      persists events; catalog_id/routing come from the execute-time descriptor,
+#      the watermark from the in-memory ChainHeads).
 #   D. CACHE — the builder's `state_builder_builds_total` shows
 #      cold_rebuild/incremental advancing (the pool-side cache is exercised under
 #      authoritative use).
@@ -238,7 +244,17 @@ echo "================================================================"
 set_state_builder offserver
 start_worker_pf
 
-SB_SCAN_BEFORE="$(metric_simple "$(fetch_server_metrics)" noetl_state_build_event_scans_total)"
+SM_BEFORE="$(fetch_server_metrics)"
+SB_SCAN_BEFORE="$(metric_simple "$SM_BEFORE" noetl_state_build_event_scans_total)"
+# RFC #115 Phase 4 remainder — the stateless-edge proof.  Under the stateless
+# off-server drive the server builds NO WorkflowState on the drive path at all
+# (not even a chain_walk PK-lookup build): noetl_state_build_total counts every
+# server-side state build (event_scan OR chain_walk), so its delta over the
+# offserver leg must be 0.  The positive signal is the new
+# orchestrate_drive_total{dispatched_offserver_stateless} + {applied_stateless}.
+SB_BUILD_BEFORE="$(metric_simple "$SM_BEFORE" noetl_state_build_total)"
+SB_STATELESS_BEFORE="$(metric_label "$SM_BEFORE" noetl_orchestrate_drive_total dispatched_offserver_stateless)"
+SB_APPLIED_SL_BEFORE="$(metric_label "$SM_BEFORE" noetl_orchestrate_drive_total applied_stateless)"
 WM_BEFORE="$(fetch_worker_metrics)"
 W_SERVED_BEFORE="$(metric_label "$WM_BEFORE" noetl_worker_state_builder_drive_builds_total served)"
 W_FB_BEFORE="$(metric_label "$WM_BEFORE" noetl_worker_state_builder_drive_builds_total fallback_incomplete)"
@@ -250,7 +266,11 @@ W_INCR_BEFORE="$(metric_label "$WM_BEFORE" noetl_worker_state_builder_builds_tot
 run_leg offserver; OFF_EID="$LEG_EID"; OFF_STATUS="$LEG_STATUS"
 echo "kind-val: offserver leg execution_id=$OFF_EID final_status=$OFF_STATUS"
 
-SB_SCAN_AFTER="$(metric_simple "$(fetch_server_metrics)" noetl_state_build_event_scans_total)"
+SM_AFTER="$(fetch_server_metrics)"
+SB_SCAN_AFTER="$(metric_simple "$SM_AFTER" noetl_state_build_event_scans_total)"
+SB_BUILD_D=$(( $(metric_simple "$SM_AFTER" noetl_state_build_total) - SB_BUILD_BEFORE ))
+SB_STATELESS_D=$(( $(metric_label "$SM_AFTER" noetl_orchestrate_drive_total dispatched_offserver_stateless) - SB_STATELESS_BEFORE ))
+SB_APPLIED_SL_D=$(( $(metric_label "$SM_AFTER" noetl_orchestrate_drive_total applied_stateless) - SB_APPLIED_SL_BEFORE ))
 WM_AFTER="$(fetch_worker_metrics)"
 W_SERVED_D=$(( $(metric_label "$WM_AFTER" noetl_worker_state_builder_drive_builds_total served) - W_SERVED_BEFORE ))
 W_FB_D=$(( $(metric_label "$WM_AFTER" noetl_worker_state_builder_drive_builds_total fallback_incomplete) - W_FB_BEFORE ))
@@ -260,7 +280,8 @@ W_COLD_D=$(( $(metric_label "$WM_AFTER" noetl_worker_state_builder_builds_total 
 W_INCR_D=$(( $(metric_label "$WM_AFTER" noetl_worker_state_builder_builds_total incremental) - W_INCR_BEFORE ))
 SB_SCAN_D=$(( SB_SCAN_AFTER - SB_SCAN_BEFORE ))
 echo "kind-val: worker — drive served=+$W_SERVED_D fallback=+$W_FB_D event_scans=+$W_SCAN_D wal_events=+$W_WAL_D cold=+$W_COLD_D incr=+$W_INCR_D"
-echo "kind-val: server — state_build_event_scans=+$SB_SCAN_D (want 0, chain_walk)"
+echo "kind-val: server — state_build_event_scans=+$SB_SCAN_D (want 0)"
+echo "kind-val: server — state_build_total=+$SB_BUILD_D (want 0 — stateless edge builds NO state) dispatched_offserver_stateless=+$SB_STATELESS_D applied_stateless=+$SB_APPLIED_SL_D"
 
 EVENT_ROWS="$(count_rows "SELECT COUNT(*) AS n FROM noetl.event WHERE execution_id = $OFF_EID")"
 DISTINCT_IDS="$(count_rows "SELECT COUNT(DISTINCT event_id) AS n FROM noetl.event WHERE execution_id = $OFF_EID")"
@@ -299,8 +320,16 @@ echo "kind-val: server fingerprint = [$SRV_FP]"
 [[ "$W_SCAN_D" -eq 0 ]]   || fail "worker state_builder_event_scans advanced (+$W_SCAN_D) — the builder is NOT WAL-only"
 [[ "$W_WAL_D" -ge 1 ]]    || fail "worker consumed 0 WAL events (+$W_WAL_D) — the drain is not reading noetl_events"
 
-# C. No server rebuild/scan on the drive path (chain_walk → PK lookups only).
+# C. No server rebuild/scan on the drive path.
 [[ "$SB_SCAN_D" -eq 0 ]]  || fail "server state_build_event_scans advanced (+$SB_SCAN_D) — the drive path scanned noetl.event"
+
+# C2. ZERO server state rebuild on the drive path (RFC #115 Phase 4 remainder /
+#     #107 step 2): the stateless edge builds NO WorkflowState at all — neither
+#     event_scan nor chain_walk — so noetl_state_build_total stays flat, and the
+#     stateless dispatch + apply counters advance (the server just routed).
+[[ "$SB_BUILD_D" -eq 0 ]] || fail "server state_build_total advanced (+$SB_BUILD_D) — the drive path rebuilt WorkflowState (not a stateless edge)"
+[[ "$SB_STATELESS_D" -ge 1 ]] || fail "server did not take the stateless drive path (dispatched_offserver_stateless +$SB_STATELESS_D) — descriptor cold or flag off"
+[[ "$SB_APPLIED_SL_D" -ge 1 ]] || fail "server did not apply via the stateless path (applied_stateless +$SB_APPLIED_SL_D)"
 
 # D. Cache exercised under authoritative use.
 [[ $(( W_COLD_D + W_INCR_D )) -ge 1 ]] || fail "no cold_rebuild/incremental cache builds (+$W_COLD_D/+$W_INCR_D) — cache not exercised"
@@ -318,7 +347,8 @@ if [[ "$OVERALL" -eq 0 ]]; then
   echo "kind-val: PASS — off-server state builder drive cutover authoritative under the gate"
   echo "  A. parity: offserver==server fingerprint [$OFF_FP], both COMPLETED"
   echo "  B. WAL-build served the decision: +$W_SERVED_D (fallback +$W_FB_D), worker scans +$W_SCAN_D, WAL events +$W_WAL_D"
-  echo "  C. server drive path scan-free (chain_walk): state_build_event_scans +$SB_SCAN_D"
+  echo "  C. server drive path scan-free: state_build_event_scans +$SB_SCAN_D"
+  echo "  C2. STATELESS edge — server state_build_total +$SB_BUILD_D (zero rebuild), dispatched_offserver_stateless +$SB_STATELESS_D, applied_stateless +$SB_APPLIED_SL_D"
   echo "  D. cache: cold_rebuild +$W_COLD_D / incremental +$W_INCR_D"
   echo "  E. sole-writer $EVENT_ROWS==$DISTINCT_IDS, catalog0=$CATALOG_ZERO, orch_event=0/cmd=$ORCH_COMMAND_ROWS, dup=$MAT_DUP_HITS"
   echo "================================================================"
