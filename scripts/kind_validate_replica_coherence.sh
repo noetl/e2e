@@ -50,10 +50,19 @@
 #      NULL), no dangling prev pointer, the head-walk reaches every row (a single
 #      unforked chain — the property the head CAS guarantees).
 #
+# noetl/ai-meta#117 — the off-server spine is replayed in prev_event_id CHAIN
+# order (walked from the server's ChainHeads tip = expected_head), not event_id
+# order, so a high-concurrency fan-out whose branch completions arrive id-inverted
+# still completes (pre-#117 the max-id walk missed the inverted tip and the reduce
+# never fired).  Set NOETL_COHERENCE_FANOUT_BURST=N to launch an extra burst of N
+# concurrent fanout_reduce executions that concentrates the inversion.
+#
 # Usage:
 #   ./scripts/kind_validate_replica_coherence.sh
 #   ./scripts/kind_validate_replica_coherence.sh --context kind-noetl
 #   NOETL_SERVER_URL=http://localhost:18082 ./scripts/kind_validate_replica_coherence.sh
+#   NOETL_COHERENCE_DRIVE_AFFINITY=shipped NOETL_COHERENCE_FANOUT_BURST=9 \
+#     ./scripts/kind_validate_replica_coherence.sh   # #117 high-concurrency stress
 #
 # Exits 0 if PASS; 1 if any hard assertion fails; 2 on a precondition error.
 
@@ -334,6 +343,32 @@ for entry in "${FIXTURES[@]}"; do
     echo "kind-val:   run $i execution_id=$eid"
   done
 done
+
+# Higher-concurrency fan-out stress (noetl/ai-meta#117).  The off-server spine is
+# replayed in prev_event_id CHAIN order (walked from the server's ChainHeads tip),
+# not event_id order, so a fan-out whose concurrent branch completions arrive at
+# the owner id-inverted (a higher-id event linked as the predecessor of a
+# lower-id one) still completes — pre-#117 such an execution wedged because the
+# max-id walk missed the inverted tip and the reduce never fired.  Launch an extra
+# BURST of fanout_reduce executions all at once to concentrate that
+# concurrent-branch-arrival reordering.  Default 0 (off); set e.g. 9 to stress.
+FANOUT_BURST="${NOETL_COHERENCE_FANOUT_BURST:-0}"
+if [[ "$FANOUT_BURST" -gt 0 ]]; then
+  FO_FIXTURE="$REPO_ROOT/fixtures/playbooks/fanout_reduce/fanout_reduce_phase6.yaml"
+  FO_PATH="tests/fixtures/fanout_reduce_phase6"
+  echo
+  echo "kind-val: #117 fan-out burst × $FANOUT_BURST (concurrent fanout_reduce — id-inversion stress)"
+  noetl register playbook --file "$FO_FIXTURE" >/dev/null 2>&1 || true
+  for ((b=1; b<=FANOUT_BURST; b++)); do
+    eid="$(noetl exec "$FO_PATH" --runtime distributed --json 2>/dev/null \
+      | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["execution_id"])
+except Exception: print("")')"
+    if [[ -z "$eid" ]]; then fail "could not launch fan-out burst $b"; continue; fi
+    EIDS+=("$eid")
+    echo "kind-val:   burst $b execution_id=$eid"
+  done
+fi
 
 echo
 echo "kind-val: waiting for ${#EIDS[@]} executions to reach a terminal status…"
