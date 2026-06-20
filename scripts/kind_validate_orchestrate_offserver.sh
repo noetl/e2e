@@ -36,17 +36,23 @@
 #      orchestrate-plugin activity; the default (user) worker pool ran no
 #      `__orchestrate__` meta-step.
 #   7. Large-context convergence (noetl/ai-meta#113): a fixture whose drive
-#      result exceeds the worker's 100KB inline budget reaches COMPLETED with a
-#      BOUNDED `__orchestrate__` command count, ZERO decode errors, and the
-#      offloaded-ref resolve path exercised (`ref_resolved` advanced). Guards
-#      the bug where an offloaded drive result was dropped → non-convergent loop.
+#      result would exceed the worker's 100KB inline budget reaches COMPLETED
+#      with a BOUNDED `__orchestrate__` command count, ZERO decode errors, and
+#      ZERO `__orchestrate__` rows in noetl.event. Guards the bug where an
+#      offloaded drive result was dropped → non-convergent loop. The
+#      offloaded-ref resolve advance (`ref_resolved`) is only a HARD assertion
+#      under NOETL_RIG_EXPECT_OFFLOAD=true (a refs_in_state=false server); under
+#      the default refs_in_state=true the drive result is reference-only and the
+#      path stays informational.
 #   8. Oversized next-command context offload (noetl/ai-meta#114): a fixture
-#      whose next-step command context exceeds the NATS max_payload reaches
-#      COMPLETED, the offload path fired (`context_offloaded` advanced) + the
-#      worker resolved it (`context_ref_resolved` advanced), and NO
-#      `command.issued` event for the run exceeds the NATS ceiling. Guards the
-#      bug where the full upstream context embedded in `command.issued` blew the
-#      1MB publish limit → wedge.
+#      whose next-step command context would exceed the NATS max_payload reaches
+#      COMPLETED, NO `command.issued` event for the run exceeds the NATS ceiling,
+#      and ZERO `__orchestrate__` rows in noetl.event. Guards the bug where the
+#      full upstream context embedded in `command.issued` blew the 1MB publish
+#      limit → wedge. The offload-advance (`context_offloaded` /
+#      `context_ref_resolved`) is only a HARD assertion under
+#      NOETL_RIG_EXPECT_OFFLOAD=true; under the default refs_in_state=true the
+#      next-command context is reference-only and the path stays informational.
 #
 # Preconditions: the kind server must run a post-#110 image (server f3043c9 /
 # v3.28.0 or later) with the worker-driven drive ON — either the code default
@@ -71,6 +77,19 @@ NOETL_WORKER_DEPLOY="${NOETL_WORKER_DEPLOY:-noetl-worker-rust}"
 NOETL_SYSTEM_POOL_DEPLOY="${NOETL_SYSTEM_POOL_DEPLOY:-noetl-worker-system-pool}"
 NOETL_SERVER_URL="${NOETL_SERVER_URL:-http://localhost:8082}"
 TIMEOUT_SECS="${NOETL_ORCH_TIMEOUT_SECS:-180}"
+
+# Whether the #113/#114 offload SAFETY paths are expected to FIRE this run.
+# Those paths (worker offloads an over-budget drive result / the server offloads
+# an over-budget next-command context) only trigger when result payloads are
+# spliced inline — i.e. under `NOETL_REFS_IN_STATE=false`.  Under the current
+# default (`refs_in_state=true`, RFC #115 Phase 1) events/commands carry
+# references, not bulk data, so steady-state contexts never reach the offload
+# thresholds and the metrics legitimately stay flat.  Default false → the
+# offload-advance assertions become informational; the COMPLETE + no-oversized
+# + zero-`__orchestrate__`-event invariants stay HARD in both modes.  Set to
+# true when deliberately running the rig against a `refs_in_state=false` server
+# to keep the strict offload-exercise guards.
+RIG_EXPECT_OFFLOAD="${NOETL_RIG_EXPECT_OFFLOAD:-false}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -363,9 +382,18 @@ else
 
   # 7c. The offloaded path was actually exercised — `ref_resolved` advanced.
   #     Proves this fixture genuinely crossed the inline budget (so the guard
-  #     is real, not vacuously green on a small result).
-  [[ "$REF_RESOLVED_DELTA" -ge 1 ]] \
-    || fail "noetl_orchestrate_drive_total{stage=ref_resolved} did not advance (+$REF_RESOLVED_DELTA) — the large-context fixture did not exceed the inline budget, so this phase did not exercise the #113 path"
+  #     is real, not vacuously green on a small result).  Only HARD under
+  #     refs_in_state=false (RIG_EXPECT_OFFLOAD=true): with the default
+  #     refs_in_state=true the drive result carries references, never an
+  #     over-budget inline payload, so this path legitimately does not fire.
+  if [[ "$RIG_EXPECT_OFFLOAD" == "true" ]]; then
+    [[ "$REF_RESOLVED_DELTA" -ge 1 ]] \
+      || fail "noetl_orchestrate_drive_total{stage=ref_resolved} did not advance (+$REF_RESOLVED_DELTA) — the large-context fixture did not exceed the inline budget, so this phase did not exercise the #113 path (RIG_EXPECT_OFFLOAD=true)"
+  elif [[ "$REF_RESOLVED_DELTA" -ge 1 ]]; then
+    echo "kind-val: large-context — offloaded-ref resolve fired (+$REF_RESOLVED_DELTA) [informational under refs_in_state=true]"
+  else
+    echo "kind-val: large-context — offloaded-ref resolve did NOT fire (refs_in_state=true keeps the drive result reference-only; convergence + zero-decode-error guards above are the real assertions)"
+  fi
 
   # 7d. Bounded orchestrate-command count — no runaway PENDING loop.
   [[ "${LARGE_ORCH_CMDS:-9999}" -le "$LARGE_ORCH_CMD_CEILING" ]] \
@@ -439,14 +467,24 @@ else
   [[ "$OVERSIZE_STATUS" == "COMPLETED" ]] \
     || fail "oversized-context fixture did not converge: status=$OVERSIZE_STATUS (the #114 publish-wall wedge, or a slow run beyond ${TIMEOUT_SECS}s)"
 
-  # 8b. The offload path actually fired — proves this fixture genuinely produced
-  #     an over-budget command context (the guard is real, not vacuously green).
-  [[ "$OFFLOADED_DELTA" -ge 1 ]] \
-    || fail "noetl_orchestrate_drive_total{stage=context_offloaded} did not advance (+$OFFLOADED_DELTA) — the fixture did not exceed NOETL_COMMAND_CONTEXT_MAX_BYTES, so this phase did not exercise the #114 path"
-
-  # 8c. The worker read path resolved the offloaded context back.
-  [[ "$CTX_RESOLVED_DELTA" -ge 1 ]] \
-    || fail "noetl_orchestrate_drive_total{stage=context_ref_resolved} did not advance (+$CTX_RESOLVED_DELTA) — worker never resolved the offloaded command context"
+  # 8b/8c. The offload path actually fired (server offloaded an over-budget
+  #     command context; the read side resolved it back).  Only HARD under
+  #     refs_in_state=false (RIG_EXPECT_OFFLOAD=true): with the default
+  #     refs_in_state=true the next-command context carries references, not the
+  #     full upstream payload, so it never reaches NOETL_COMMAND_CONTEXT_MAX_BYTES
+  #     and the offload safety path legitimately stays flat.  The COMPLETE (8a),
+  #     no-oversized-event (8d) and zero-`__orchestrate__`-event (8e) invariants
+  #     below stay HARD in both modes.
+  if [[ "$RIG_EXPECT_OFFLOAD" == "true" ]]; then
+    [[ "$OFFLOADED_DELTA" -ge 1 ]] \
+      || fail "noetl_orchestrate_drive_total{stage=context_offloaded} did not advance (+$OFFLOADED_DELTA) — the fixture did not exceed NOETL_COMMAND_CONTEXT_MAX_BYTES, so this phase did not exercise the #114 path (RIG_EXPECT_OFFLOAD=true)"
+    [[ "$CTX_RESOLVED_DELTA" -ge 1 ]] \
+      || fail "noetl_orchestrate_drive_total{stage=context_ref_resolved} did not advance (+$CTX_RESOLVED_DELTA) — worker never resolved the offloaded command context (RIG_EXPECT_OFFLOAD=true)"
+  elif [[ "$OFFLOADED_DELTA" -ge 1 || "$CTX_RESOLVED_DELTA" -ge 1 ]]; then
+    echo "kind-val: oversized-context — command-context offload fired (offloaded=+$OFFLOADED_DELTA resolved=+$CTX_RESOLVED_DELTA) [informational under refs_in_state=true]"
+  else
+    echo "kind-val: oversized-context — command-context offload did NOT fire (refs_in_state=true keeps next-command contexts reference-only; the COMPLETE + sub-ceiling + zero-orchestrate-event guards below are the real assertions)"
+  fi
 
   # 8d. No command.issued event for the run exceeds the NATS max_payload.
   [[ "${OVERSIZE_MAX_CTX:-0}" -gt 0 && "${OVERSIZE_MAX_CTX:-0}" -lt "$NATS_MAX_PAYLOAD" ]] \
