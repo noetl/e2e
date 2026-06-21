@@ -11,6 +11,44 @@ It exists alongside the Python-era `fixtures/REGRESSION_TESTING.md` framework
 This runner drives `/api/execute` directly, so it works against the Rust stack
 and points easily at kind or prod.
 
+## Prod-scoped validator (`prod_regression_validate.py`)
+
+`prod_regression_validate.py` is the hardened variant for running against a
+**live production** server under the CQRS gate-ON cutover (`PUBLISH_ONLY=true`
++ `STATE_BUILDER=offserver`), where test data is NOT cleanable (no DELETE API,
+long retention, shared DB). Differences from the bash runner:
+
+- **Tenant isolation** — registers each fixture under a `prod-e2e-<ts>/`
+  catalog-path prefix (rewrites `metadata.path` + any sub-playbook step
+  `path`) so every row a run creates is identifiable for operator cleanup.
+- **Gate-ON proof per execution** — verifies, directly from the DB via
+  `noetl query`, the sole-writer (event rows == distinct ids, 0 `catalog_id=0`,
+  0 `__orchestrate__` event rows, ≥1 `__orchestrate__` command) + clean-chain
+  (roots=1 / terminals=1 / dangling=0 / head-walk == rows) invariants, plus
+  the never-scan invariant (worker
+  `noetl_worker_state_builder_event_scans_total` delta 0) and materializer lag
+  from `/metrics`.
+- **Materialization-aware** — waits for the system-pool materializer to project
+  the terminal event before asserting (status flips from in-memory drive state
+  a moment before the rows land under PUBLISH_ONLY).
+
+```bash
+# port-forward the prod server + system-pool /metrics first, then:
+scripts/prod_regression_validate.py --base http://localhost:18082 \
+    --prefix prod-e2e-$(date +%Y%m%d-%H%M) --set smoke
+scripts/prod_regression_validate.py --base http://localhost:18082 \
+    --prefix prod-e2e-$(date +%Y%m%d-%H%M) --set core
+```
+
+The `smoke`/`core` sets are credential-free / in-cluster-only fixtures. Fixtures
+needing external creds/services (pagination test-server, external HTTP egress,
+`pg_local`/`pg_noetl_k8s` unreachable from prod, auth0/amadeus/openai/IB/
+snowflake) and the heavy/OOM/burst fixtures are deliberately excluded — see the
+script's `SKIP_NOTES`. First validated against live prod 2026-06-20 (server
+v3.39.1 / worker v5.40.2): 28/30 executions PASS, the 2 non-PASS being
+pg-credential-unreachable env differences (clean `playbook.failed` terminal +
+single-root chain — the failure path is gate-ON-correct), not cutover bugs.
+
 ## Usage
 
 ```bash
