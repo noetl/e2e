@@ -1,0 +1,76 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: test_resolve_by_urn
+  path: tests/resolve_by_urn_test
+  description: |
+    Over-budget TABULAR producer + a downstream step that binds the BULK of it —
+    the consume path for the #104 Phase C resolve-by-URN read path.
+
+    - `start` emits a canonical `{columns, rows}` rowset large enough to exceed
+      the inline budget, so the worker externalizes it (durable result_ref +
+      stamped canonical `reference.uri`); the shadow result materializer writes
+      it as Arrow Feather at the derived §7 key in object store (GCS on kind).
+    - `settle` waits so the (separate-consumer) materializer has written the
+      Feather object before the consume step resolves it.
+    - `consume` binds `{{ start.rows[1100] }}` (an array element well past the
+      summary's `[0]`) so the worker MUST resolve the full payload — flag-on it
+      resolves by URN from the Feather tier in GCS; flag-off (or on a miss) it
+      falls back to the authoritative `noetl.result_store`. Either way the full
+      1200-row payload is bound, so `row_count == 1200` proves the bulk resolved.
+
+    The flag-on vs flag-off consume output is byte-identical (parity); the
+    worker `noetl_worker_result_resolve_total{outcome}` metric distinguishes
+    which path served it.
+workload:
+  row_count: 1200
+  cell_size: 200
+  probe_row: 1100
+workflow:
+- step: start
+  tool:
+  - name: generate_rows
+    kind: python
+    input:
+      rows: '{{ row_count }}'
+      width: '{{ cell_size }}'
+    code: "cells = \"A\" * width\nresult = {\n    \"columns\": [\"id\", \"name\", \"blob\"],\n    \"rows\": [[i, \"row_%d\" % i, cells] for i in range(rows)],\n}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: settle
+- step: settle
+  tool:
+  - name: pause
+    kind: python
+    input:
+      has_columns: '{{ start.columns is defined }}'
+    code: "import time\ntime.sleep(18)\nresult = {\"settled\": True, \"has_columns\": has_columns}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: consume
+- step: consume
+  tool:
+  - name: bind_bulk
+    kind: python
+    input:
+      n: '{{ start.rows | length }}'
+      deep_id: '{{ start.rows[1100][0] }}'
+    code: "rc = int(n)\ndid = int(deep_id)\nresult = {\n    \"row_count\": rc,\n    \"deep_id\": did,\n    \"bulk_resolved\": rc == 1200 and did == 1100,\n}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: done
+- step: done
+  tool:
+  - name: finish
+    kind: python
+    input:
+      ok: '{{ consume.bulk_resolved }}'
+      rc: '{{ consume.row_count }}'
+      did: '{{ consume.deep_id }}'
+    code: "result = {\n    \"row_count\": int(rc),\n    \"deep_id\": int(did),\n    \"test_passed\": bool(ok) and int(rc) == 1200 and int(did) == 1100,\n}\n"

@@ -1,0 +1,61 @@
+# fake-gcs-server — a GCS-compatible object-store emulator for kind validation of
+# the #104 Phase C resolve-by-URN read path. The server's GCS object backend
+# (NOETL_OBJECT_STORE_BACKEND=gcs) PUTs/GETs the Feather/JSON result tier here so
+# kind never touches real GCS. In-memory backend; ephemeral by design.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-gcs-server
+  namespace: noetl
+  labels:
+    app: fake-gcs-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fake-gcs-server
+  template:
+    metadata:
+      labels:
+        app: fake-gcs-server
+    spec:
+      containers:
+      - name: fake-gcs-server
+        image: fsouza/fake-gcs-server:1.49.2
+        args:
+        - "-scheme"
+        - "http"
+        - "-port"
+        - "4443"
+        - "-backend"
+        - "memory"
+        - "-external-url"
+        - "http://fake-gcs-server.noetl.svc.cluster.local:4443"
+        ports:
+        - containerPort: 4443
+        readinessProbe:
+          tcpSocket:
+            port: 4443
+          initialDelaySeconds: 2
+          periodSeconds: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-gcs-server
+  namespace: noetl
+  labels:
+    app: fake-gcs-server
+spec:
+  selector:
+    app: fake-gcs-server
+  ports:
+  - port: 4443
+    targetPort: 4443
