@@ -1,0 +1,40 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: test_large_tabular_result
+  path: tests/large_tabular_result_test
+  description: |
+    Over-budget TABULAR result producer for the shadow result materializer
+    (noetl/ai-meta#104 Phase B).
+
+    The `start` step emits a canonical `{columns, rows}` rowset large enough to
+    exceed the inline budget, so the worker externalizes it (durable result_ref
+    + stamped canonical reference.uri) AND `noetl_tools::arrow_codec` detects it
+    as tabular.  The shadow result materializer therefore writes it as Arrow
+    **Feather** at the derived §7 key — the counterpart to
+    test_large_result_extraction (non-tabular dict -> JSON tier).
+workload:
+  row_count: 1200
+  cell_size: 200
+workflow:
+- step: start
+  tool:
+  - name: generate_rows
+    kind: python
+    input:
+      rows: '{{ row_count }}'
+      width: '{{ cell_size }}'
+    code: "cells = \"A\" * width\nresult = {\n    \"columns\": [\"id\", \"name\", \"blob\"],\n\
+      \    \"rows\": [[i, \"row_%d\" % i, cells] for i in range(rows)],\n}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: done
+- step: done
+  tool:
+  - name: finish
+    kind: python
+    input:
+      has_columns: '{{ start.columns is defined }}'
+    code: "result = {\n    \"tabular_externalized\": has_columns,\n    \"test_passed\": True,\n}\n"
