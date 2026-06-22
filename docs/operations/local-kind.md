@@ -98,3 +98,35 @@ scripts/kind_validate_orchestrate_gate.sh --context kind-noetl
 ```
 
 Exit codes match the rig above.
+
+### Canonical result-URI shadow accept (#104 Phase A)
+
+`scripts/kind_validate_result_uri_accept.sh` proves
+[noetl/ai-meta#104](https://github.com/noetl/ai-meta/issues/104) Phase A —
+the server *accepts* the canonical logical result URI the worker stamps on
+over-budget references (`reference.uri = noetl://<tenant>/<project>/results/
+<eid>/<step>/<frame>/<row>/<attempt>`) without yet resolving by it (Phase C)
+or writing the Feather tier (Phase B). It requires the same off-server gate
+stack as the rig above, PLUS a server image carrying `NOETL_RESULT_URI_ACCEPT`
++ the `noetl_result_uri_accept_total` metric. On the embedded-NATS kind
+topology it rolls the workers after each server env flip (so they
+re-establish their `noetl_events` consumers against the fresh NATS) and runs
+the over-budget producer `tests/large_result_extraction_test` twice:
+
+- **Flag ON** (`NOETL_RESULT_URI_ACCEPT=true`) — the event carries a
+  canonical `reference.uri`, `noetl_result_uri_accept_total{outcome="canonical"}`
+  advances ≥1, `{outcome="malformed"}` stays 0, the execution `COMPLETED`,
+  and the sole-writer invariants hold (per-exec `event_rows == distinct ids`,
+  `catalog_id=0` rows 0, `__orchestrate__` rows 0, materializer `duplicates=0`).
+- **Flag OFF** (`NOETL_RESULT_URI_ACCEPT=false`) — the same fixture still
+  externalizes, the accept counter delta is `0` (true no-op), the execution
+  still `COMPLETED`, and the invariants still hold — Phase A perturbs neither
+  the drive nor the materialize path.
+
+```bash
+# with the gate + drive + materializer env on, reachable at localhost:8082,
+# and a server image carrying the Phase-A flag:
+scripts/kind_validate_result_uri_accept.sh --context kind-noetl
+```
+
+Exit codes match the rigs above.
