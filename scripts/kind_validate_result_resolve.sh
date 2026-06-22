@@ -126,25 +126,28 @@ trap cleanup EXIT
 # ----------------------------------------------------------------------
 # Helpers.
 # ----------------------------------------------------------------------
-count_rows() { noetl query "$1" --format json 2>/dev/null \
+count_rows() { { noetl query "$1" --format json 2>/dev/null || true; } \
   | python3 -c 'import json,sys
 d=json.loads(sys.stdin.read() or "{}").get("result", [])
 print(d[0].get("n", 0) if d else 0)'; }
 
 # Sum a server-metric series matching a grep pattern (counter value = last field).
 server_metric() {  # grep_pattern
-  curl -fsS "$NOETL_SERVER_URL/metrics" 2>/dev/null \
-    | grep -E "$1" | awk '{s+=$NF} END{printf "%d", s+0}'
+  # A counter with zero observations is ABSENT from /metrics, so grep matches
+  # nothing and exits 1 — under set -euo pipefail that would abort the baseline
+  # read. Guard curl + grep so a legitimately-zero baseline yields 0, not a kill.
+  { curl -fsS "$NOETL_SERVER_URL/metrics" 2>/dev/null || true; } \
+    | { grep -E "$1" || true; } | awk '{s+=$NF} END{printf "%d", s+0}'
 }
 
 # Sum a worker-metric series across all pods of the worker pool deployment.
 worker_metric() {  # grep_pattern
   local sel pod total=0 v
   sel="$("${KCTX[@]}" get deploy "$NOETL_WORKER_POOL_DEPLOY" -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(f"{k}={v}" for k,v in d.items()))')"
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(f"{k}={v}" for k,v in d.items()))')" || true
   for pod in $("${KCTX[@]}" get pods -l "$sel" -o name 2>/dev/null); do
     v="$("${KCTX[@]}" exec "$pod" -- wget -qO- http://localhost:9090/metrics 2>/dev/null \
-         | grep -E "$1" | awk '{s+=$NF} END{printf "%d", s+0}')" || true
+         | { grep -E "$1" || true; } | awk '{s+=$NF} END{printf "%d", s+0}')" || true
     total=$((total + ${v:-0}))
   done
   echo "$total"
