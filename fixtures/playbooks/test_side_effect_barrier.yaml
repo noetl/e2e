@@ -1,0 +1,118 @@
+apiVersion: noetl.io/v2
+kind: Playbook
+metadata:
+  name: test_side_effect_barrier
+  path: tests/side_effect_barrier
+  description: |
+    A SIDE-EFFECTING, over-budget producer + a downstream binder — the fixture
+    for the #104 Phase E side-effect durability barrier.
+
+    - `charge` (python, side-effecting) performs a COUNTED external side effect:
+      it creates a uniquely-named marker object in the `se-markers` fake-gcs
+      bucket (one object per *execution* of the step), AND returns an
+      over-budget `{columns, rows}` rowset so the worker externalizes it
+      (durable result_ref + stamped canonical `reference.uri`) and the result
+      materializer writes it as Arrow Feather at the derived §7 key — the URN
+      the barrier checks. The unique marker name means a re-execution creates a
+      SECOND object, so the marker count is a deterministic side-effect counter.
+    - `settle` waits so the (separate-consumer) materializer has written the
+      Feather object before any re-drive resolves it.
+    - `consume` binds `{{ start.rows[1100] }}` (well past the summary's `[0]`)
+      so the full payload must resolve; `row_count == 1200` proves the bulk
+      bound — the adopted result is usable downstream, not just skipped.
+    - `pure` (noop, NON-side-effecting) exists so a re-drive of it proves the
+      barrier never blocks a non-side-effecting cycle (the gate short-circuits;
+      no barrier metric ever carries a non-side-effecting tool).
+
+    The rig forges a re-drive of a step (a fresh, non-terminal command for the
+    same `(execution_id, step)` -> the same derived URN) and observes the marker
+    count: flag-on the barrier skips `charge`'s re-execution (count stays 1),
+    flag-off it re-executes (count 2); a re-drive of `pure` re-runs regardless.
+workload:
+  row_count: 1200
+  cell_size: 200
+  gcs_host: fake-gcs-server.noetl.svc.cluster.local:4443
+  marker_bucket: se-markers
+workflow:
+- step: start
+  desc: SIDE-EFFECTING producer — counted marker object + over-budget result
+  tool:
+  - name: do_charge
+    kind: python
+    input:
+      rows: '{{ row_count }}'
+      width: '{{ cell_size }}'
+      gcs_host: '{{ gcs_host }}'
+      bucket: '{{ marker_bucket }}'
+      eid: '{{ execution_id }}'
+    code: |
+      import urllib.request, urllib.parse, time, random
+      # The external side effect: a uniquely-named marker object. A new name per
+      # call means a re-execution adds a SECOND object — the deterministic
+      # side-effect counter the rig reads back via the fake-gcs list API.
+      name = "marker/%s_%d_%d" % (str(eid), int(time.time() * 1e6), random.randint(0, 10**9))
+      url = "http://%s/upload/storage/v1/b/%s/o?uploadType=media&name=%s" % (
+          gcs_host, bucket, urllib.parse.quote(name, safe=""))
+      urllib.request.urlopen(
+          urllib.request.Request(url, data=b"x", method="POST"), timeout=15
+      )
+      # The over-budget result that tiers to the URN the barrier checks.
+      cells = "A" * width
+      result = {
+          "columns": ["id", "name", "blob"],
+          "rows": [[i, "row_%d" % i, cells] for i in range(rows)],
+      }
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: settle
+- step: settle
+  desc: let the result materializer write charge's Feather tier object
+  tool:
+  - name: pause
+    kind: python
+    input:
+      has_columns: '{{ start.columns is defined }}'
+    code: "import time\ntime.sleep(18)\nresult = {\"settled\": True, \"has_columns\": has_columns}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: consume
+- step: consume
+  desc: bind the BULK of charge's result (proves the adopted result is usable)
+  tool:
+  - name: bind_bulk
+    kind: python
+    input:
+      n: '{{ start.rows | length }}'
+      deep_id: '{{ start.rows[1100][0] }}'
+    code: "rc = int(n)\ndid = int(deep_id)\nresult = {\n    \"row_count\": rc,\n    \"deep_id\": did,\n    \"bulk_resolved\": rc == 1200 and did == 1100,\n}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: done
+- step: done
+  desc: compute the pass flag (consume's bulk binding proves the result resolved)
+  tool:
+  - name: finish
+    kind: python
+    input:
+      ok: '{{ consume.bulk_resolved }}'
+      rc: '{{ consume.row_count }}'
+    code: "result = {\n    \"row_count\": int(rc),\n    \"test_passed\": bool(ok) and int(rc) == 1200,\n}\n"
+  next:
+    spec:
+      mode: exclusive
+    arcs:
+    - step: pure
+- step: pure
+  desc: NON-side-effecting TERMINAL step (noop) — a re-drive of it must never hit
+    the barrier (gate short-circuits) and, being terminal, cascades nothing
+  tool:
+  - name: passthru
+    kind: noop
+    result:
+      marker: pure-ran
