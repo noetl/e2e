@@ -146,7 +146,7 @@ worker_metric() {  # grep_pattern
   sel="$("${KCTX[@]}" get deploy "$NOETL_WORKER_POOL_DEPLOY" -o jsonpath='{.spec.selector.matchLabels}' 2>/dev/null \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(f"{k}={v}" for k,v in d.items()))')" || true
   for pod in $("${KCTX[@]}" get pods -l "$sel" -o name 2>/dev/null); do
-    v="$("${KCTX[@]}" exec "$pod" -- wget -qO- http://localhost:9090/metrics 2>/dev/null \
+    v="$("${KCTX[@]}" exec "$pod" -- wget -qO- http://127.0.0.1:9090/metrics 2>/dev/null \
          | { grep -E "$1" || true; } | awk '{s+=$NF} END{printf "%d", s+0}')" || true
     total=$((total + ${v:-0}))
   done
@@ -249,9 +249,17 @@ PUT1="$(server_metric 'noetl_object_store_ops_total\{backend="gcs",op="put",outc
 GET1="$(server_metric 'noetl_object_store_ops_total\{backend="gcs",op="get",outcome="ok"\}')"
 RF1="$(worker_metric 'noetl_worker_result_resolve_total\{outcome="resolved_(feather|json)"\}')"
 echo "kind-val: pass1 — gcs put Δ=$((PUT1-PUT0)) get Δ=$((GET1-GET0)) resolved(feather|json) Δ=$((RF1-RF0)) passed=$P1_RC"
-[[ $((PUT1-PUT0)) -ge 1 ]] || fail "pass1 server wrote no Feather to GCS (put Δ0)"
-[[ $((GET1-GET0)) -ge 1 ]] || fail "pass1 server served no object from GCS (get Δ0)"
-[[ $((RF1-RF0)) -ge 1 ]]   || fail "pass1 worker did not resolve by URN from object store (resolved_feather+resolved_json Δ0)"
+# HARD, authoritative proof of resolve-from-object-store: the server's object
+# backend serves a GET *only* when a worker calls resolve_by_urn -> object_get,
+# so server-side `gcs get Δ>=1` proves the worker resolved by URN. These are read
+# off the SERVER /metrics (stable, single endpoint) — reliable.
+[[ $((PUT1-PUT0)) -ge 1 ]] || fail "pass1 server wrote no object to GCS (put Δ0)"
+[[ $((GET1-GET0)) -ge 1 ]] || fail "pass1 server served no object from GCS (get Δ0) — resolve-by-URN did not fetch"
+# Worker-side confirmation of the resolve outcome + tier (resolved_feather when
+# the rowset Arrow-encodes, else resolved_json). `worker_metric` scrapes the pod
+# on 127.0.0.1:9090 (the metrics server binds IPv4 0.0.0.0:9090; `localhost` would
+# resolve to ::1 and refuse).
+[[ $((RF1-RF0)) -ge 1 ]] || fail "pass1 worker did not resolve by URN from object store (resolved_feather+resolved_json Δ0)"
 
 # ======================================================================
 # PASS 2 — forced miss: resolve ON, materializer OFF -> fail-safe fallback.
@@ -270,6 +278,9 @@ P2_EID="$LEG_EID"; P2_RC="$LEG_OUT"
 assert_sole_writer "$P2_EID" "pass2"
 FM1="$(worker_metric 'noetl_worker_result_resolve_total\{outcome="fallback_object_miss"\}')"
 echo "kind-val: pass2 — fallback_object_miss Δ=$((FM1-FM0)) passed=$P2_RC status=$LEG_STATUS"
+# Fail-safe fallback: with the materializer OFF no object is written, so
+# resolve-by-URN MUST miss and fall back to the authoritative store. Both the
+# worker fallback counter AND the bound payload prove it.
 [[ $((FM1-FM0)) -ge 1 ]] || fail "pass2 did not record a fail-safe object-miss fallback"
 
 # ======================================================================
