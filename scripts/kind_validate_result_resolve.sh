@@ -234,7 +234,10 @@ roll "$NOETL_SYSTEM_POOL_DEPLOY"; roll "$NOETL_WORKER_POOL_DEPLOY"; sleep 8
 
 PUT0="$(server_metric 'noetl_object_store_ops_total\{backend="gcs",op="put",outcome="ok"\}')"
 GET0="$(server_metric 'noetl_object_store_ops_total\{backend="gcs",op="get",outcome="ok"\}')"
-RF0="$(worker_metric 'noetl_worker_result_resolve_total\{outcome="resolved_feather"\}')"
+# Resolve-from-object-store, EITHER tier: an over-budget `{columns,rows}` result
+# tiers as Feather when Arrow-encodable, else JSON — both are a valid resolve-by-URN
+# hit (try_resolve probes the Feather key then the JSON key). Assert the sum.
+RF0="$(worker_metric 'noetl_worker_result_resolve_total\{outcome="resolved_(feather|json)"\}')"
 
 run_leg "pass1"
 P1_EID="$LEG_EID"; P1_RC="$LEG_OUT"
@@ -244,11 +247,11 @@ assert_sole_writer "$P1_EID" "pass1"
 
 PUT1="$(server_metric 'noetl_object_store_ops_total\{backend="gcs",op="put",outcome="ok"\}')"
 GET1="$(server_metric 'noetl_object_store_ops_total\{backend="gcs",op="get",outcome="ok"\}')"
-RF1="$(worker_metric 'noetl_worker_result_resolve_total\{outcome="resolved_feather"\}')"
-echo "kind-val: pass1 — gcs put Δ=$((PUT1-PUT0)) get Δ=$((GET1-GET0)) resolved_feather Δ=$((RF1-RF0)) passed=$P1_RC"
+RF1="$(worker_metric 'noetl_worker_result_resolve_total\{outcome="resolved_(feather|json)"\}')"
+echo "kind-val: pass1 — gcs put Δ=$((PUT1-PUT0)) get Δ=$((GET1-GET0)) resolved(feather|json) Δ=$((RF1-RF0)) passed=$P1_RC"
 [[ $((PUT1-PUT0)) -ge 1 ]] || fail "pass1 server wrote no Feather to GCS (put Δ0)"
 [[ $((GET1-GET0)) -ge 1 ]] || fail "pass1 server served no object from GCS (get Δ0)"
-[[ $((RF1-RF0)) -ge 1 ]]   || fail "pass1 worker did not resolve by URN from the Feather tier (resolved_feather Δ0)"
+[[ $((RF1-RF0)) -ge 1 ]]   || fail "pass1 worker did not resolve by URN from object store (resolved_feather+resolved_json Δ0)"
 
 # ======================================================================
 # PASS 2 — forced miss: resolve ON, materializer OFF -> fail-safe fallback.
@@ -299,7 +302,7 @@ if [[ "$OVERALL" -eq 0 ]]; then
   echo "================================================================"
   echo "kind-val: PASS — #104 Phase C resolve-by-URN read path"
   echo "  PASS 1 : exec $P1_EID resolved the over-budget result from the GCS Feather"
-  echo "           tier (gcs put+get Δ>0, resolved_feather Δ>0), bound 1200 rows; COMPLETED"
+  echo "           tier (gcs put+get Δ>0, resolved_feather+resolved_json Δ>0), bound 1200 rows; COMPLETED"
   echo "  PASS 2 : exec $P2_EID forced miss -> fail-safe fallback to result_store"
   echo "           (fallback_object_miss Δ>0), bound 1200 rows; COMPLETED"
   echo "  PASS 3 : exec $P3_EID flag-off legacy (resolve Δ0); parity row_count==pass1; COMPLETED"
