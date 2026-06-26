@@ -3,16 +3,32 @@ kind: Playbook
 metadata:
   name: auth0_validate_session
   path: api_integration/auth0/auth0_validate_session
-  description: "Validate NoETL session token and refresh NATS cache.\n\nFlow:\n  1.\
-    \ Validates session in Postgres (source of truth)\n  2. If valid, caches/refreshes\
-    \ session in NATS K/V\n  3. Sends callback to gateway with validation result\n\
-    \nGateway Integration:\n  - Gateway first checks NATS K/V for cached session\n\
-    \  - If cache miss, gateway calls this playbook\n  - Playbook validates from Postgres\
-    \ and repopulates NATS cache\n  - Gateway can then fetch session from NATS K/V\n\
-    \nInput:\n  - session_token: NoETL session token\n  - request_id: Gateway request\
-    \ ID for callback\n\nOutput (via callback):\n  - valid: Boolean (true if session\
-    \ is valid)\n  - user: User details (user_id, email, display_name)\n  - expires_at:\
-    \ Session expiration timestamp\n  - message: Validation result message\n"
+  description: |
+    Validate a NoETL session token and refresh the NATS session cache.
+
+    Flow:
+      1. start: Validate the session in Postgres (source of truth)
+      2. If valid: fetch roles, repopulate the NATS K/V cache, send a
+         {valid:true,...} callback to the gateway
+      3. If invalid/expired: send a {valid:false} callback
+
+    Gateway Integration:
+      - Gateway first checks NATS K/V for a cached session
+      - On cache miss, the gateway executes this playbook (mirrors the
+        check_playbook_access execute-via-callback flow)
+      - This playbook validates from Postgres, repopulates the NATS cache,
+        and POSTs the result to /api/internal/callback
+
+    Input:
+      - session_token: NoETL session token
+      - request_id: Gateway request ID for the callback
+      - callback_subject: Gateway NATS callback subject (legacy/compat)
+
+    Output (via callback):
+      - valid: Boolean (true if the session is valid)
+      - user: User details (user_id, email, display_name, roles)
+      - expires_at: Session expiration timestamp
+      - message: Validation result message
   tags:
   - auth0
   - validation
@@ -23,36 +39,49 @@ workload:
   db_credential: pg_auth
   nats_credential: nats_credential
   session_bucket: sessions
+  callback_subject: ''
   request_id: ''
   gateway_url: http://gateway.gateway.svc.cluster.local
 workflow:
 - step: start
-  desc: Lookup and validate session from Postgres (source of truth)
+  desc: Lookup and validate the session from Postgres (source of truth)
   tool:
     kind: postgres
     auth: '{{ db_credential }}'
-    command: "SELECT\n  s.session_id,\n  s.session_token,\n  s.user_id,\n  s.expires_at,\n\
-      \  s.is_active,\n  u.email,\n  u.display_name,\n  u.is_active as user_is_active,\n\
-      \  CASE\n    WHEN s.expires_at < NOW() THEN false\n    WHEN NOT s.is_active\
-      \ THEN false\n    WHEN NOT u.is_active THEN false\n    ELSE true\n  END as session_valid\n\
-      FROM auth.sessions s\nJOIN auth.users u ON s.user_id = u.user_id\nWHERE s.session_token\
-      \ = '{{ session_token }}';\n"
+    # session_token is carried out under the non-sensitive alias `sess_ref`:
+    # the server + worker redact any result field whose name contains "token"
+    # before persisting to the event log, which would replace the real token
+    # with "[REDACTED]" before the NATS-cache step can read it.  expires_at is
+    # cast to text to avoid timestamp-serialization drift.
+    command: |
+      SELECT
+        s.user_id,
+        s.session_token AS sess_ref,
+        s.expires_at::text AS expires_at,
+        u.email,
+        u.display_name,
+        CASE
+          WHEN s.expires_at < NOW() THEN false
+          WHEN NOT s.is_active THEN false
+          WHEN NOT u.is_active THEN false
+          ELSE true
+        END AS session_valid
+      FROM auth.sessions s
+      JOIN auth.users u ON s.user_id = u.user_id
+      WHERE s.session_token = ('{{ session_token | tojson | replace("'", "''") }}'::jsonb #>> '{}');
   next:
     spec:
       mode: exclusive
     arcs:
     - step: get_user_roles
-      when: '{{ start.command_0.rows | length > 0 and start.command_0.rows[0].session_valid
-        }}'
+      when: '{{ start.rows is defined and start.rows | length > 0 and start.rows[0].session_valid }}'
     - step: send_invalid_callback
-      when: '{{ request_id and (start.command_0.rows | length == 0 or not start.command_0.rows[0].session_valid)
-        }}'
+      when: '{{ request_id and (start.rows is not defined or start.rows | length == 0 or not start.rows[0].session_valid) }}'
     - step: end
-      when: '{{ not request_id and (start.command_0.rows | length == 0 or not start.command_0.rows[0].session_valid)
-        }}'
+      when: '{{ not request_id and (start.rows is not defined or start.rows | length == 0 or not start.rows[0].session_valid) }}'
 
 - step: get_user_roles
-  desc: Fetch roles for validated user
+  desc: Fetch roles for the validated user
   tool:
     kind: postgres
     auth: '{{ db_credential }}'
@@ -63,7 +92,7 @@ workflow:
       ) AS roles
       FROM auth.user_roles ur
       JOIN auth.roles r ON ur.role_id = r.role_id
-      WHERE ur.user_id = {{ start.command_0.rows[0].user_id }}
+      WHERE ur.user_id = {{ start.rows[0].user_id }}
         AND (ur.expires_at IS NULL OR ur.expires_at > NOW());
   next:
     spec:
@@ -72,14 +101,56 @@ workflow:
     - step: prepare_session_cache
 
 - step: prepare_session_cache
-  desc: Prepare session payload with roles
+  desc: Prepare the session payload with roles
   tool:
     kind: python
-    libs:
-      json: json
+    input:
+      start: '{{ start }}'
+      get_user_roles: '{{ get_user_roles }}'
     code: |
-      session_row = context.get('start', {}).get('command_0', {}).get('rows', [{}])[0]
-      roles = context.get('get_user_roles', {}).get('command_0', {}).get('rows', [{}])[0].get('roles', [])
+      import json
+
+      def rows_from_step(step):
+          def pick(obj, *keys):
+              current = obj
+              for key in keys:
+                  if current is None:
+                      return None
+                  if isinstance(current, dict):
+                      current = current.get(key)
+                      continue
+                  getter = getattr(current, "get", None)
+                  if callable(getter):
+                      try:
+                          current = getter(key)
+                          continue
+                      except Exception:
+                          pass
+                  try:
+                      current = getattr(current, key)
+                  except Exception:
+                      return None
+              return current
+
+          step = step or {}
+          for candidate in (
+              pick(step, "rows"),
+              pick(step, "context", "rows"),
+              pick(step, "context", "_prev", "rows"),
+              pick(step, "data", "rows"),
+              pick(step, "data", "context", "rows"),
+              pick(step, "command_0", "rows"),
+              pick(step, "context", "command_0", "rows"),
+          ):
+              if candidate:
+                  return candidate
+          return []
+
+      session_rows = rows_from_step(args.get("start"))
+      session_row = session_rows[0] if session_rows else {}
+
+      role_rows = rows_from_step(args.get("get_user_roles"))
+      roles = role_rows[0].get("roles", []) if role_rows else []
       if isinstance(roles, str):
           try:
               roles = json.loads(roles)
@@ -97,7 +168,7 @@ workflow:
 
       result = {
           "session_cache": {
-              "session_token": session_row.get("session_token"),
+              "sess_ref": session_row.get("sess_ref"),
               "user_id": session_row.get("user_id"),
               "email": session_row.get("email"),
               "display_name": session_row.get("display_name"),
@@ -112,35 +183,45 @@ workflow:
       mode: exclusive
     arcs:
     - step: cache_session
+
 - step: cache_session
-  desc: Cache valid session in NATS K/V for fast gateway lookups
+  desc: Repopulate the NATS K/V session cache for fast gateway lookups
   tool:
     kind: nats
     auth: '{{ nats_credential }}'
     operation: kv_put
     bucket: '{{ session_bucket }}'
-    key: '{{ prepare_session_cache.session_cache.session_token }}'
-    value: '{{ prepare_session_cache.session_cache }}'
+    # Key + value are rendered and written to NATS K/V before the call.done
+    # event redaction fires, so the real token (sourced from sess_ref) reaches
+    # the cache.  The value is built explicitly with the gateway-contract field
+    # name `session_token` so the gateway's CachedSession can read it.
+    key: '{{ prepare_session_cache.session_cache.sess_ref }}'
+    value:
+      session_token: '{{ prepare_session_cache.session_cache.sess_ref }}'
+      user_id: '{{ prepare_session_cache.session_cache.user_id }}'
+      email: '{{ prepare_session_cache.session_cache.email }}'
+      display_name: '{{ prepare_session_cache.session_cache.display_name }}'
+      expires_at: '{{ prepare_session_cache.session_cache.expires_at }}'
+      is_active: '{{ prepare_session_cache.session_cache.is_active }}'
+      roles: '{{ prepare_session_cache.session_cache.roles }}'
   next:
     spec:
       mode: exclusive
     arcs:
     - step: send_success_callback
-- step: send_success_callback
-  desc: Send success callback to gateway
-  tool:
-  - name: prepare
-    kind: python
-    code: 'result = {"status": "callback_ready"}
+      when: '{{ request_id }}'
+    - step: end
+      when: '{{ not request_id }}'
 
-      '
-  - name: send_callback
+- step: send_success_callback
+  desc: Send the valid-session callback to the gateway
+  tool:
     kind: http
     method: POST
     url: '{{ gateway_url }}/api/internal/callback'
     headers:
       Content-Type: application/json
-    data:
+    json:
       request_id: '{{ request_id }}'
       status: success
       data:
@@ -148,32 +229,21 @@ workflow:
         user: '{{ prepare_session_cache.user }}'
         expires_at: '{{ prepare_session_cache.session_cache.expires_at }}'
         message: Session is valid
-    spec:
-      policy:
-        rules:
-        - when: '{{ output.status == ''error'' }}'
-          then:
-            do: continue
-        - else:
-            then:
-              do: continue
   next:
     spec:
       mode: exclusive
     arcs:
     - step: end
-      when: '{{ request_id }}'
-    - step: end
-      when: '{{ not request_id }}'
+
 - step: send_invalid_callback
-  desc: Send invalid session callback to gateway
+  desc: Send the invalid-session callback to the gateway
   tool:
     kind: http
     method: POST
     url: '{{ gateway_url }}/api/internal/callback'
     headers:
       Content-Type: application/json
-    data:
+    json:
       request_id: '{{ request_id }}'
       status: success
       data:
@@ -184,10 +254,10 @@ workflow:
       mode: exclusive
     arcs:
     - step: end
+
 - step: end
   desc: Complete
   tool:
     kind: python
-    code: 'result = {"status": "complete"}
-
-      '
+    code: |
+      result = {"status": "complete"}
