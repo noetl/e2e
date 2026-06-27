@@ -119,9 +119,9 @@ workflow:
         mode: exclusive
       arcs:
         - step: check_permission
-          when: "{{ normalize_session.context.rows is defined and normalize_session.context.rows | length > 0 }}"
-        - step: access_denied
-          when: "{{ normalize_session.context.rows is not defined or normalize_session.context.rows | length == 0 }}"
+          when: "{{ normalize_session.rows is defined and normalize_session.rows | length > 0 }}"
+        - step: access_denied_no_session
+          when: "{{ normalize_session.rows is not defined or normalize_session.rows | length == 0 }}"
 
   - step: check_permission
     desc: Check permissions
@@ -134,7 +134,7 @@ workflow:
         FROM auth.user_roles ur
         JOIN auth.roles r ON ur.role_id = r.role_id
         JOIN auth.playbook_permissions pp ON r.role_id = pp.role_id
-        WHERE ur.user_id = {{ normalize_session.context.user.user_id }}
+        WHERE ur.user_id = {{ normalize_session.user.user_id }}
           AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
           AND (
             pp.playbook_path = ('{{ playbook_path | tojson | replace("'", "''") }}'::jsonb #>> '{}')
@@ -151,9 +151,9 @@ workflow:
         mode: exclusive
       arcs:
         - step: access_granted
-          when: "{{ check_permission.context.rows is defined and check_permission.context.rows | length > 0 and check_permission.context.rows[0].has_permission }}"
-        - step: access_denied
-          when: "{{ check_permission.context.rows is not defined or check_permission.context.rows | length == 0 or not check_permission.context.rows[0].has_permission }}"
+          when: "{{ check_permission.rows is defined and check_permission.rows | length > 0 and check_permission.rows[0].has_permission }}"
+        - step: access_denied_no_permission
+          when: "{{ check_permission.rows is not defined or check_permission.rows | length == 0 or not check_permission.rows[0].has_permission }}"
 
   - step: access_granted
     desc: Return allowed
@@ -162,9 +162,9 @@ workflow:
       input:
         playbook_path: "{{ playbook_path }}"
         action: "{{ action }}"
-        user_id: "{{ normalize_session.context.user.user_id }}"
-        email: "{{ normalize_session.context.user.email }}"
-        display_name: "{{ normalize_session.context.user.display_name }}"
+        user_id: "{{ normalize_session.user.user_id }}"
+        email: "{{ normalize_session.user.email }}"
+        display_name: "{{ normalize_session.user.display_name }}"
       code: |
         result = {
             "allowed": True,
@@ -190,7 +190,7 @@ workflow:
       url: "{{ gateway_url }}/api/internal/callback"
       headers:
         Content-Type: application/json
-      data:
+      json:
         request_id: "{{ request_id }}"
         status: "success"
         data:
@@ -198,9 +198,9 @@ workflow:
           playbook_path: "{{ access_granted.playbook_path }}"
           permission_type: "{{ access_granted.action }}"
           user:
-            user_id: "{{ normalize_session.context.user.user_id }}"
-            email: "{{ normalize_session.context.user.email }}"
-            display_name: "{{ normalize_session.context.user.display_name }}"
+            user_id: "{{ normalize_session.user.user_id }}"
+            email: "{{ normalize_session.user.email }}"
+            display_name: "{{ normalize_session.user.display_name }}"
           message: "{{ access_granted.message }}"
     next:
       spec:
@@ -208,8 +208,8 @@ workflow:
       arcs:
         - step: end
 
-  - step: access_denied
-    desc: Return denied
+  - step: access_denied_no_session
+    desc: Return denied - no active session
     tool:
       kind: python
       input:
@@ -220,7 +220,30 @@ workflow:
             "allowed": False,
             "playbook_path": playbook_path,
             "action": action,
-            "message": "Access denied"
+            "message": "Access denied - no active session"
+        }
+    next:
+      spec:
+        mode: exclusive
+      arcs:
+        - step: send_denied_callback
+          when: "{{ request_id }}"
+        - step: end
+          when: "{{ not request_id }}"
+
+  - step: access_denied_no_permission
+    desc: Return denied - no permission
+    tool:
+      kind: python
+      input:
+        playbook_path: "{{ playbook_path }}"
+        action: "{{ action }}"
+      code: |
+        result = {
+            "allowed": False,
+            "playbook_path": playbook_path,
+            "action": action,
+            "message": "Access denied - insufficient permission"
         }
     next:
       spec:
@@ -239,14 +262,14 @@ workflow:
       url: "{{ gateway_url }}/api/internal/callback"
       headers:
         Content-Type: application/json
-      data:
+      json:
         request_id: "{{ request_id }}"
         status: "success"
         data:
           allowed: false
-          playbook_path: "{{ access_denied.playbook_path }}"
-          permission_type: "{{ access_denied.action }}"
-          message: "{{ access_denied.message }}"
+          playbook_path: "{{ playbook_path }}"
+          permission_type: "{{ action }}"
+          message: "Access denied"
     next:
       spec:
         mode: exclusive
