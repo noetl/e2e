@@ -269,6 +269,41 @@ export ANALYST_TOKEN="<analyst_token>"
 export VIEWER_TOKEN="<viewer_token>"
 ```
 
+### Test 3b: ID-token signature verification (noetl/ai-meta#169)
+
+**Objective**: Verify the `auth0_login` `start` step's RS256 signature
+verification (JWKS + `iss`/`exp`/`nbf`/optional `aud`), mirroring the
+server-side check shipped in `noetl/server` PR #276.
+
+This path is the DRIVE fallback used only when `NOETL_AUTH_SYNC` is off;
+the live synchronous login path verifies in-process on the server. The
+`start` step does pure-stdlib RS256 verification (no PyJWT / cryptography —
+the worker image ships neither) gated behind the same tri-state flag as the
+server:
+
+| `NOETL_AUTH_VERIFY_SIGNATURE` | Behaviour |
+|---|---|
+| unset / `off` / `false` / `0` | **Default.** Verification never runs; result is byte-identical to the historical claims-only decode (no JWKS fetch, no new dependency, no new failure mode). |
+| `shadow` / `log` | Verify + log the would-reject to stderr, but still allow (canary-observation lever). |
+| `enforce` / `true` / `1` | Reject a token that fails signature/claims (result carries `{"error": ...}` → the token-error callback path). |
+
+Config env (all optional): `NOETL_AUTH0_DOMAIN` (issuer/JWKS fallback when
+the request omits `auth0_domain`), `NOETL_AUTH0_AUDIENCE` (comma-separated;
+**unset ⇒ `aud` not enforced** — the Muno SPA's `aud` is the client_id, a
+secret we don't hard-code), `NOETL_AUTH_JWT_LEEWAY_SECS` (default 60).
+
+**Offline unit tests** — no cluster, no network, no Auth0 tenant:
+```bash
+python3 fixtures/playbooks/api_integration/auth0/test_start_jwt_verify.py
+# 34 passed, 0 failed
+```
+The test extracts the verification code directly from `auth0_login.yaml`
+(no copy → no drift) and covers: valid token, tampered signature, tampered
+payload, wrong issuer, wrong/absent audience, expired, nbf-not-yet-valid,
+unknown `kid`, `alg:none` + HS256 forgeries, leeway, tri-state flag parsing,
+and full-step gate wiring (off/shadow allow a bad signature; enforce
+rejects it).
+
 ### Test 4: Session Validation
 
 **Objective**: Verify session token validation returns user details and roles.
