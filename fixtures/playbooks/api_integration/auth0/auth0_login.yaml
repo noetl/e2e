@@ -63,6 +63,176 @@ workflow:
         import base64
         import json
         import time
+        import os
+        import sys
+        import hashlib
+
+        # ── noetl/ai-meta#169: Auth0 RS256 signature verification (drive path) ──
+        #
+        # This step is the DRIVE fallback used only when NOETL_AUTH_SYNC is off;
+        # the live synchronous login path (noetl-server handlers::auth::login)
+        # already got JWKS-based RS256 verification in server PR #276.  This block
+        # mirrors that behaviour semantically for the playbook path so #169 covers
+        # both.
+        #
+        # Pure Python stdlib ONLY — the worker runtime image (Alpine + python3)
+        # ships no PyJWT / cryptography, and default-OFF must add no dependency.
+        # RSA verification is `sig^e mod n` compared against the EMSA-PKCS1-v1_5
+        # (RFC 8017) padded SHA-256 digest, done with big-int `pow()` + hashlib.
+        #
+        # Flag NOETL_AUTH_VERIFY_SIGNATURE is tri-state (default off):
+        #   off      → verification never runs; result is byte-identical to the
+        #              historical claims-only decode below (no JWKS fetch, no new
+        #              failure mode, no external dependency exercised).
+        #   shadow   → verify + log the would-reject to stderr, but STILL allow
+        #              (the canary-observation lever; decision unchanged).
+        #   enforce  → a token that fails signature/claims is rejected (result
+        #              carries {"error": <reason>} → the same token-error path a
+        #              bad claims-decode takes).
+        # Reject reasons are a fixed taxonomy; the token, key material, and claim
+        # VALUES are never logged.
+
+        _SHA256_DIGEST_INFO = bytes([
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+            0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+        ])
+
+        def _verify_mode():
+            v = (os.environ.get("NOETL_AUTH_VERIFY_SIGNATURE") or "").strip().lower()
+            if v in ("shadow", "log", "observe"):
+                return "shadow"
+            if v in ("true", "1", "enforce", "on"):
+                return "enforce"
+            # Unknown / empty / off → never enforce (a typo can't silently reject).
+            return "off"
+
+        def _cfg_audiences():
+            raw = os.environ.get("NOETL_AUTH0_AUDIENCE") or ""
+            return [a.strip() for a in raw.split(",") if a.strip()]
+
+        def _cfg_leeway():
+            try:
+                return int(os.environ.get("NOETL_AUTH_JWT_LEEWAY_SECS") or "60")
+            except Exception:
+                return 60
+
+        def _b64u_decode(s):
+            if isinstance(s, str):
+                s = s.encode("ascii")
+            return base64.urlsafe_b64decode(s + b"=" * ((-len(s)) % 4))
+
+        def _b64u_to_int(s):
+            return int.from_bytes(_b64u_decode(s), "big")
+
+        def _rs256_ok(signing_input, signature, n, e):
+            # RFC 8017 RSASSA-PKCS1-v1_5 verify with SHA-256.
+            k = (n.bit_length() + 7) // 8
+            if len(signature) != k:
+                return False
+            sig_int = int.from_bytes(signature, "big")
+            if sig_int >= n:
+                return False
+            em = pow(sig_int, e, n).to_bytes(k, "big")
+            digest = hashlib.sha256(signing_input).digest()
+            t = _SHA256_DIGEST_INFO + digest
+            if k < len(t) + 11:
+                return False
+            expected = b"\x00\x01" + (b"\xff" * (k - len(t) - 3)) + b"\x00" + t
+            # constant-time compare
+            if len(em) != len(expected):
+                return False
+            diff = 0
+            for a, b in zip(em, expected):
+                diff |= a ^ b
+            return diff == 0
+
+        def _select_jwk(jwks, kid):
+            keys = jwks.get("keys", []) if isinstance(jwks, dict) else []
+            if kid:
+                for key in keys:
+                    if key.get("kid") == kid:
+                        return key, None
+                return None, ("unknown_kid", "no JWKS key for token kid")
+            if len(keys) == 1:
+                return keys[0], None
+            return None, ("malformed", "token header has no kid and JWKS is not single-key")
+
+        def _verify_with_jwks(token, jwks, issuer, audiences, leeway):
+            # Pure core (no HTTP / no env) — returns None on success, or
+            # (outcome, reason) on failure.  Unit-tested offline.
+            parts = token.split(".")
+            if len(parts) != 3:
+                return ("malformed", "unparseable token header")
+            try:
+                header = json.loads(_b64u_decode(parts[0]))
+            except Exception:
+                return ("malformed", "unparseable token header")
+            # RS256 only — this is what rejects alg=none / HS256 forgeries.
+            if header.get("alg") != "RS256":
+                return ("bad_signature", "unexpected token algorithm")
+            jwk, err = _select_jwk(jwks, header.get("kid"))
+            if err is not None:
+                return err
+            if jwk.get("kty") != "RSA":
+                return ("jwks_unavailable", "JWKS key is not a usable RSA key")
+            try:
+                n = _b64u_to_int(jwk["n"])
+                e = _b64u_to_int(jwk["e"])
+            except Exception:
+                return ("jwks_unavailable", "JWKS key is not a usable RSA key")
+            try:
+                signature = _b64u_decode(parts[2])
+            except Exception:
+                return ("bad_signature", "invalid signature")
+            signing_input = (parts[0] + "." + parts[1]).encode("ascii")
+            if not _rs256_ok(signing_input, signature, n, e):
+                return ("bad_signature", "invalid signature")
+            try:
+                claims = json.loads(_b64u_decode(parts[1]))
+            except Exception:
+                return ("malformed", "unparseable token payload")
+            if claims.get("iss") != issuer:
+                return ("bad_claims", "invalid issuer")
+            now = int(time.time())
+            exp = claims.get("exp")
+            if exp is not None and now > int(exp) + leeway:
+                return ("bad_claims", "token expired")
+            nbf = claims.get("nbf")
+            if nbf is not None and now + leeway < int(nbf):
+                return ("bad_claims", "token not yet valid (nbf)")
+            if audiences:
+                aud = claims.get("aud")
+                aud_list = aud if isinstance(aud, list) else ([aud] if aud is not None else [])
+                if not any(a in audiences for a in aud_list):
+                    return ("bad_claims", "invalid audience")
+            return None
+
+        def _fetch_jwks(url):
+            # Separated so tests can stub it; each login fetches once (the
+            # subprocess is ephemeral, so there is no process-global TTL cache
+            # like the Rust side — an always-fresh fetch makes key rotation
+            # transparent by construction).
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if getattr(resp, "status", 200) not in (200, None):
+                    raise ValueError("JWKS endpoint returned HTTP %s" % resp.status)
+                return json.loads(resp.read().decode("utf-8"))
+
+        def _run_signature_verify(token, domain):
+            # Returns None on success, or (outcome, reason) on failure.
+            domain = (domain or "").strip() or (os.environ.get("NOETL_AUTH0_DOMAIN") or "").strip()
+            if not domain:
+                return ("no_domain", "signature verification enabled but no Auth0 domain configured")
+            issuer = f"https://{domain}/"
+            jwks_url = f"https://{domain}/.well-known/jwks.json"
+            try:
+                jwks = _fetch_jwks(jwks_url)
+            except Exception:
+                # Backend problem (endpoint unreachable), NOT a bad token.
+                return ("jwks_unavailable", "JWKS fetch failed")
+            return _verify_with_jwks(token, jwks, issuer, _cfg_audiences(), _cfg_leeway())
+
+        # ── historical claims-only decode (UNCHANGED — the flag-off behaviour) ──
         token = args.get('auth0_token', '')
         auth0_domain = args.get('auth0_domain', '')
         try:
@@ -91,6 +261,20 @@ workflow:
             }
         except Exception as e:
             result = {"error": str(e)}
+
+        # ── #169 additive gate: only runs in shadow / enforce ──
+        _mode = _verify_mode()
+        if _mode != "off" and isinstance(result, dict) and "error" not in result:
+            _fail = _run_signature_verify(token, auth0_domain)
+            if _fail is not None:
+                _outcome, _reason = _fail
+                # Fixed taxonomy only — never the token / key / claim values.
+                sys.stderr.write(
+                    "noetl.auth.jwt_verify mode=%s outcome=%s reason=%s\n"
+                    % (_mode, _outcome, _reason)
+                )
+                if _mode == "enforce":
+                    result = {"error": _reason}
       spec:
         policy:
           rules:
