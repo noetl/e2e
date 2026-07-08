@@ -56,10 +56,10 @@ workflow:
     tool:
       kind: http
       method: POST
-      endpoint: "https://{{ auth0_domain }}/oauth/token"
+      url: "https://{{ auth0_domain }}/oauth/token"
       headers:
         Content-Type: "application/json"
-      payload:
+      json:
         grant_type: "password"
         username: "{{ username }}"
         password: "{{ password }}"
