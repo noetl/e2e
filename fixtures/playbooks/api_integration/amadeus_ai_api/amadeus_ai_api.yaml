@@ -39,18 +39,11 @@ keychain:
       client_id: '{{ amadeus_key_path }}'
       client_secret: '{{ amadeus_secret_path }}'
 
-  - name: amadeus_token
-    kind: oauth2
-    scope: global
-    auto_renew: true
-    endpoint: https://test.api.amadeus.com/v1/security/oauth2/token
-    method: POST
-    headers:
-      Content-Type: application/x-www-form-urlencoded
-    data:
-      grant_type: client_credentials
-      client_id: '{{ keychain.amadeus_credentials.client_id }}'
-      client_secret: '{{ keychain.amadeus_credentials.client_secret }}'
+  # NOTE: the former `amadeus_token` (kind: oauth2, auto-mint) keychain entry
+  # was removed — the Rust runtime does not implement oauth2-keychain token
+  # minting.  The token is now acquired by an explicit `get_amadeus_token`
+  # http step that consumes the resolvable `keychain.amadeus_credentials.*`
+  # (noetl/ai-meta#151).
 
 workflow:
   - step: start
@@ -97,7 +90,7 @@ workflow:
       headers:
         Authorization: "Bearer {{ keychain.openai_token.api_key }}"
         Content-Type: "application/json"
-      payload:
+      json:
         model: "gpt-4o-mini"
         messages:
           - role: system
@@ -270,6 +263,29 @@ workflow:
     next:
       spec: { mode: exclusive }
       arcs:
+        - step: get_amadeus_token
+
+  # Mint the Amadeus OAuth2 access token explicitly (client_credentials).
+  # The former `amadeus_token` keychain entry (kind: oauth2) relied on an
+  # auto-mint the Rust runtime does not implement; the resolvable
+  # `keychain.amadeus_credentials.*` (kind: secrets / provider: gcp) now
+  # feed an explicit token exchange — the pattern noetl/ai-meta#151
+  # endorses over the unsupported oauth2 wallet shape.
+  - step: get_amadeus_token
+    desc: Mint Amadeus OAuth2 token (client_credentials)
+    tool:
+      kind: http
+      method: POST
+      url: "{{ workload.api_url }}/v1/security/oauth2/token"
+      headers:
+        Content-Type: "application/x-www-form-urlencoded"
+      form:
+        grant_type: "client_credentials"
+        client_id: "{{ keychain.amadeus_credentials.client_id }}"
+        client_secret: "{{ keychain.amadeus_credentials.client_secret }}"
+    next:
+      spec: { mode: exclusive }
+      arcs:
         - step: amadeus_search
 
   - step: amadeus_search
@@ -279,9 +295,9 @@ workflow:
       method: POST
       url: "{{ workload.api_url }}/v2/shopping/flight-offers"
       headers:
-        Authorization: "Bearer {{ keychain.amadeus_token.access_token }}"
+        Authorization: "Bearer {{ get_amadeus_token.data.access_token }}"
         Content-Type: "application/json"
-      payload:
+      json:
         currencyCode: "USD"
         originDestinations:
           - id: "1"
@@ -475,7 +491,7 @@ workflow:
       headers:
         Authorization: "Bearer {{ keychain.openai_token.api_key }}"
         Content-Type: "application/json"
-      payload:
+      json:
         model: "gpt-4o-mini"
         messages:
           - role: system

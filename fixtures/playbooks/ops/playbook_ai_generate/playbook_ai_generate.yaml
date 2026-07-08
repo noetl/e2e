@@ -60,7 +60,7 @@ workflow:
       headers:
         Authorization: "Bearer {{ keychain.openai_token.api_key }}"
         Content-Type: "application/json"
-      payload:
+      json:
         model: "{{ model }}"
         messages:
           - role: system
