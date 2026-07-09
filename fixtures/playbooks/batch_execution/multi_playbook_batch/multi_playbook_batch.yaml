@@ -83,17 +83,17 @@ workflow:
 
   - step: store_results
     desc: Store the results from all playbooks
+    # The step's intent is to persist the three sub-playbook results to a
+    # Postgres table and read back the row count.  Earlier this was plumbed
+    # through `kind: duckdb` ATTACH-ing a Postgres SECRET, which the Rust
+    # duckdb tool doesn't support (nested `auth:{pg_db:{...}}` fails
+    # ToolConfig deserialize).  A direct `kind: postgres` INSERT is the
+    # step's real intent — no DuckDB round-trip needed.
     tool:
-      kind: duckdb
-      auth:
-        pg_db:
-          source: credential
-          tool: postgres
-          key: "{{ pg_auth }}"
-      commands: |
-        ATTACH '' AS pg_db (TYPE POSTGRES, SECRET pg_db);
-
-        CREATE TABLE IF NOT EXISTS pg_db.playbook_batch_results (
+      kind: postgres
+      auth: "{{ pg_auth }}"
+      command: |
+        CREATE TABLE IF NOT EXISTS public.playbook_batch_results (
             id BIGINT PRIMARY KEY,
             execution_id TEXT,
             http_result TEXT,
@@ -101,7 +101,7 @@ workflow:
             data_result TEXT
         );
 
-        INSERT INTO pg_db.playbook_batch_results (
+        INSERT INTO public.playbook_batch_results (
             id, execution_id, http_result, weather_result, data_result
         ) VALUES (
             {{ execution_id }},
@@ -112,7 +112,7 @@ workflow:
         );
 
         SELECT COUNT(*) AS total_records
-        FROM pg_db.playbook_batch_results
+        FROM public.playbook_batch_results
         WHERE execution_id = '{{ execution_id }}';
     next:
       spec:

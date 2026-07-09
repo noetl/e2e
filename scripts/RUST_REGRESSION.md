@@ -152,3 +152,48 @@ Manager.
   `kind: agent` unsupported in the Rust engine.
 - `matrixcare_snowflake_prod` fixtures are **deliberately excluded** (prod
   Snowflake).
+
+## Quarantined & known-skip fixtures
+
+Fixtures reconciled during the 2026-07-09 drift sweep. Each carries a banner
+comment at the top of its YAML with the same reason.
+
+### Fixed + verified green (2026-07-09 sweep)
+
+- `fixtures/playbooks/data_transfer/http_to_postgres_transfer/http_to_postgres_transfer.yaml`
+  — **added to `core`.** Was failing at `transfer_http_to_pg` with
+  `Target connection string required`; fixed in noetl-tools 3.19.2
+  (noetl/tools#83 — http→postgres assembles the target DSN from alias-resolved
+  fields). The `create_table` columns were widened `INTEGER`→`BIGINT` to match
+  the tool's i64 integer binding (int4-coercion tool gap tracked in
+  noetl/ai-meta#183). Verified green on kind (worker `v5.72.1-transfer3192`):
+  100 rows transferred.
+- `fixtures/playbooks/batch_execution/multi_playbook_batch/multi_playbook_batch.yaml`
+  — **verified green, run on demand (NOT in the `core` gate).** `store_results`
+  was rewritten from an unsupported `kind: duckdb` Postgres-ATTACH to a direct
+  `kind: postgres` INSERT. It is a composition fixture: it dispatches three
+  sub-playbooks (`http_to_postgres_simple`, `control_flow_workbook`,
+  `duckdb_gcs_workload_identity/workload_identity`) that must be **pre-registered**,
+  and the last needs the **GCS workload-identity bridge** (integration-tier), so
+  it's kept out of the self-contained exit-0 `core` gate. Register the three
+  sub-playbooks first, then execute `batch_execution/multi_playbook_batch`.
+
+None of the entries below are in `core` / `integration` — do not add them back
+without clearing the blocker.
+
+### Quarantined (retired capability — will not run)
+
+| Fixture | Reason |
+| --- | --- |
+| `fixtures/playbooks/spike/spike_e2e_test.yaml` | Uses `tool: agent` + `framework: noetl` (step `trigger_failure`). `kind: agent` is **not** a Rust `ToolDefinition` variant — there is no `agent.rs`. The NoETL-as-AI-OS agent-framework spike (auto-dispatch-on-failure, self-troubleshoot agent, Ollama triage bridge) was never ported to the Rust engine. Kept in-tree as documentation of the retired capability, not as a runnable test. Revive only if the agent framework is ported. |
+
+### Known-skip (blocked on a missing dependency — DSL modernized, not yet runnable)
+
+DSL modernized to current Rust syntax so they no longer carry stale drift, but
+left out of the suite pending the dependency. One follow-up issue each.
+
+| Fixture | Blocker | Follow-up |
+| --- | --- | --- |
+| `fixtures/playbooks/container_postgres_init/container_postgres_init.yaml` | Custom image `noetl/postgres-container-test` not in kind (build ctx in-repo; not loaded). DSL modernized: `runtime:`-nested → flat snake_case, `env:` map → `[{name,value}]` array. | noetl/ai-meta#180 |
+| `fixtures/playbooks/tradedb/tradedb_create_db.yaml` | DDL lives in absent private IQT submodule (`./submodules/IQT/scripts/tradedb/create_tradedb.sql`). DSL modernized: `script:{uri,source:{type:file}}` + `with:` → inline `command:` (placeholder body). | noetl/ai-meta#181 |
+| `fixtures/playbooks/tradedb/tradedb_bootstrap.yaml` | DDL + dictionaries SQL in absent private IQT submodule. DSL modernized as above (two steps). | noetl/ai-meta#182 |
