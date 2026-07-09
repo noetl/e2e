@@ -1,3 +1,21 @@
+# ============================================================================
+# KNOWN-SKIP — not in the active regression suite.
+#
+# Blocker: the TradeDB DDL lives in the private IQT submodule at
+# `./submodules/IQT/scripts/tradedb/create_tradedb.sql`, which is NOT present in
+# this repo (the submodule is absent).  Without that SQL there is nothing to
+# execute, so the fixture cannot go green here.
+#
+# The DSL below has been modernized to the current `kind: postgres` syntax
+# (inline `command:` — the Rust postgres tool's PostgresConfig accepts
+# `command:`/`query:` only; the Python-era `script:{uri, source:{type:file}}`
+# file-loader and the `with:` block are retired and no longer deserialize).
+# The `command:` body is a placeholder that documents where the real DDL comes
+# from — it is intentionally NOT the reconstructed IQT SQL.  To make it green:
+#   1. Add the IQT submodule so create_tradedb.sql is available.
+#   2. Inline that SQL (or restore a file-loader capability) and re-validate.
+# See noetl/e2e RUST_REGRESSION.md "Known-skip fixtures" + the follow-up issue.
+# ============================================================================
 apiVersion: noetl.io/v2
 kind: Playbook
 metadata:
@@ -8,6 +26,8 @@ metadata:
 workload:
   pg_admin_auth: pg_k8s
   admin_db: postgres
+  # Source of the real DDL (absent private IQT submodule). Left as a pointer
+  # for whoever reconstructs the submodule; the step below is a placeholder.
   create_db_script_uri: ./submodules/IQT/scripts/tradedb/create_tradedb.sql
 
 workflow:
@@ -16,12 +36,13 @@ workflow:
     tool:
       kind: postgres
       auth: "{{ pg_admin_auth }}"
-      with:
-        db_name: "{{ admin_db }}"
-      script:
-        uri: "{{ create_db_script_uri }}"
-        source:
-          type: file
+      # PLACEHOLDER — real DDL is in {{ create_db_script_uri }} (absent IQT
+      # submodule). Inline the create-role + create-database statements here
+      # once the submodule is restored.
+      command: |
+        -- TradeDB role + database creation.
+        -- Real SQL: ./submodules/IQT/scripts/tradedb/create_tradedb.sql (absent).
+        SELECT 'tradedb create-db placeholder — restore IQT submodule' AS note;
     next:
       spec:
         mode: exclusive

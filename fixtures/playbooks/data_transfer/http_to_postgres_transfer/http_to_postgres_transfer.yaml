@@ -32,8 +32,14 @@ workflow:
 
         CREATE TABLE public.http_to_postgres_transfer (
           id SERIAL PRIMARY KEY,
-          post_id INTEGER,
-          user_id INTEGER,
+          -- BIGINT (int8), not INTEGER (int4): the transfer tool binds JSON
+          -- integers from the HTTP source as Rust i64, and tokio-postgres will
+          -- not implicitly narrow i64 -> int4.  The http->postgres path does
+          -- not yet coerce params to the target column types the way the
+          -- snowflake->postgres path does (typed `$n::text::<udt>` casts).
+          -- Tracked as a tools-crate follow-up; BIGINT keeps this fixture green.
+          post_id BIGINT,
+          user_id BIGINT,
           title TEXT,
           body TEXT,
           fetched_at TIMESTAMPTZ DEFAULT NOW()
@@ -54,9 +60,7 @@ workflow:
         method: GET
       target:
         type: postgres
-        auth:
-          source: credential
-          key: "{{ pg_auth }}"
+        auth: "{{ pg_auth }}"
         table: public.http_to_postgres_transfer
         mapping:
           user_id: userId

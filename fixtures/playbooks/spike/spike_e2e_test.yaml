@@ -1,3 +1,19 @@
+# ============================================================================
+# QUARANTINED — KNOWN-SKIP.  Do NOT add to the active regression suite.
+#
+# This fixture exercises the retired NoETL-as-AI-OS spike: `tool: agent` with
+# `framework: noetl` (step `trigger_failure` below).  `kind: agent` is NOT a
+# Rust `ToolDefinition` variant — there is no agent.rs in the Rust worker/tools
+# stack, and the AI-OS agent-framework spike (auto-dispatch-on-failure,
+# self-troubleshoot agent, Ollama triage bridge) was never ported to the Rust
+# engine.  Registering + executing this fixture fails at tool dispatch with an
+# unknown tool kind.
+#
+# Kept in-tree as documentation of the retired capability, not as a runnable
+# test.  If the agent framework is ever ported to Rust, revive it by adding the
+# path back to the runner and re-validating in kind.
+# See noetl/e2e RUST_REGRESSION.md "Quarantined fixtures" for the register.
+# ============================================================================
 apiVersion: noetl.io/v2
 kind: Playbook
 metadata:

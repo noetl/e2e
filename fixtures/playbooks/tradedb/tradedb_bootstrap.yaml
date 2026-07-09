@@ -1,3 +1,21 @@
+# ============================================================================
+# KNOWN-SKIP — not in the active regression suite.
+#
+# Blocker: the TradeDB DDL + dictionaries SQL live in the private IQT submodule
+# at `./submodules/IQT/scripts/tradedb/{tradedb_ddl.sql, create_dictionaries.sql}`,
+# which is NOT present in this repo (the submodule is absent).  Without that SQL
+# there is nothing to execute, so the fixture cannot go green here.
+#
+# The DSL below has been modernized to the current `kind: postgres` syntax
+# (inline `command:` — the Rust postgres tool's PostgresConfig accepts
+# `command:`/`query:` only; the Python-era `script:{uri, source:{type:file}}`
+# file-loader and the `with:` block are retired and no longer deserialize).
+# The `command:` bodies are placeholders that document where the real SQL comes
+# from — they are intentionally NOT the reconstructed IQT SQL.  To make it green:
+#   1. Add the IQT submodule so the .sql files are available.
+#   2. Inline that SQL (or restore a file-loader capability) and re-validate.
+# See noetl/e2e RUST_REGRESSION.md "Known-skip fixtures" + the follow-up issue.
+# ============================================================================
 apiVersion: noetl.io/v2
 kind: Playbook
 metadata:
@@ -8,6 +26,8 @@ metadata:
 workload:
   pg_app_auth: pg_trade
   db_name: tradedb
+  # Sources of the real SQL (absent private IQT submodule). Left as pointers
+  # for whoever reconstructs the submodule; the steps below are placeholders.
   ddl_script_uri: ./submodules/IQT/scripts/tradedb/tradedb_ddl.sql
   dictionaries_script_uri: ./submodules/IQT/scripts/tradedb/create_dictionaries.sql
 
@@ -31,12 +51,11 @@ workflow:
     tool:
       kind: postgres
       auth: "{{ pg_app_auth }}"
-      with:
-        db_name: "{{ db_name }}"
-      script:
-        uri: "{{ ddl_script_uri }}"
-        source:
-          type: file
+      # PLACEHOLDER — real DDL is in {{ ddl_script_uri }} (absent IQT submodule).
+      command: |
+        -- TradeDB schema DDL.
+        -- Real SQL: ./submodules/IQT/scripts/tradedb/tradedb_ddl.sql (absent).
+        SELECT 'tradedb ddl placeholder — restore IQT submodule' AS note;
     next:
       spec:
         mode: exclusive
@@ -48,12 +67,12 @@ workflow:
     tool:
       kind: postgres
       auth: "{{ pg_app_auth }}"
-      with:
-        db_name: "{{ db_name }}"
-      script:
-        uri: "{{ dictionaries_script_uri }}"
-        source:
-          type: file
+      # PLACEHOLDER — real SQL is in {{ dictionaries_script_uri }} (absent IQT
+      # submodule).
+      command: |
+        -- TradeDB dictionaries.
+        -- Real SQL: ./submodules/IQT/scripts/tradedb/create_dictionaries.sql (absent).
+        SELECT 'tradedb dictionaries placeholder — restore IQT submodule' AS note;
     next:
       spec:
         mode: exclusive

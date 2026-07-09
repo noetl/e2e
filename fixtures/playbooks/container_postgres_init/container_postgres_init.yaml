@@ -1,3 +1,21 @@
+# ============================================================================
+# KNOWN-SKIP — not in the active regression suite.
+#
+# Blocker: the container steps run the custom image
+# `noetl/postgres-container-test` (build context: this directory's build.sh +
+# init_schema.sh / create_tables.sh / seed_data.sh).  That image is NOT present
+# in the local kind cluster and is not published to a registry kind can pull,
+# so the container Jobs fail ImagePullBackOff.
+#
+# The DSL below has been modernized to the current `kind: container` syntax
+# (flat snake_case config, `env:` as a `[{name, value}]` array — the shape the
+# Rust container tool's ContainerConfig deserializes) so the fixture no longer
+# carries stale `runtime:`-nested / camelCase drift.  To make it green:
+#   1. Build + load the image:  ./build.sh  then
+#      `kind load docker-image noetl/postgres-container-test:latest --name noetl`
+#   2. Add the path back to CORE_FIXTURES in scripts/rust_regression_run.sh.
+# See noetl/e2e RUST_REGRESSION.md "Known-skip fixtures" + the follow-up issue.
+# ============================================================================
 apiVersion: noetl.io/v2
 kind: Playbook
 
@@ -48,29 +66,32 @@ workflow:
     desc: "Execute schema creation via container job"
     tool:
       kind: container
-      runtime:
-        provider: kubernetes
-        namespace: "{{ namespace }}"
-        image: "{{ image }}"
-        command: ["/bin/bash", "/workspace/init_schema.sh"]
-        serviceAccountName: noetl-worker
-        backoffLimit: 0
-        activeDeadlineSeconds: 600
-        cleanup: true
-        resources:
-          limits:
-            cpu: "500m"
-            memory: 512Mi
-          requests:
-            cpu: "100m"
-            memory: 128Mi
+      namespace: "{{ namespace }}"
+      image: "{{ image }}"
+      command: ["/bin/bash", "/workspace/init_schema.sh"]
+      service_account: noetl-worker
+      backoff_limit: 0
+      timeout_seconds: 600
+      resources:
+        limits:
+          cpu: "500m"
+          memory: 512Mi
+        requests:
+          cpu: "100m"
+          memory: 128Mi
       env:
-        PGHOST: postgres.postgres.svc.cluster.local
-        PGPORT: "5432"
-        PGDATABASE: demo_noetl
-        PGUSER: "demo"
-        PGPASSWORD: "demo"
-        EXECUTION_ID: "{{ execution_id }}"
+        - name: PGHOST
+          value: postgres.postgres.svc.cluster.local
+        - name: PGPORT
+          value: "5432"
+        - name: PGDATABASE
+          value: demo_noetl
+        - name: PGUSER
+          value: "demo"
+        - name: PGPASSWORD
+          value: "demo"
+        - name: EXECUTION_ID
+          value: "{{ execution_id }}"
     next:
       spec:
         mode: exclusive
@@ -81,30 +102,34 @@ workflow:
     desc: "Create test tables via container job with SQL scripts"
     tool:
       kind: container
-      runtime:
-        provider: kubernetes
-        namespace: "{{ namespace }}"
-        image: "{{ image }}"
-        command: ["/bin/bash", "/workspace/create_tables.sh"]
-        serviceAccountName: noetl-worker
-        backoffLimit: 0
-        activeDeadlineSeconds: 600
-        cleanup: true
-        resources:
-          limits:
-            cpu: "500m"
-            memory: 512Mi
-          requests:
-            cpu: "100m"
-            memory: 128Mi
+      namespace: "{{ namespace }}"
+      image: "{{ image }}"
+      command: ["/bin/bash", "/workspace/create_tables.sh"]
+      service_account: noetl-worker
+      backoff_limit: 0
+      timeout_seconds: 600
+      resources:
+        limits:
+          cpu: "500m"
+          memory: 512Mi
+        requests:
+          cpu: "100m"
+          memory: 128Mi
       env:
-        PGHOST: postgres.postgres.svc.cluster.local
-        PGPORT: "5432"
-        PGDATABASE: demo_noetl
-        PGUSER: "demo"
-        PGPASSWORD: "demo"
-        EXECUTION_ID: "{{ execution_id }}"
-        SCHEMA_NAME: container_test
+        - name: PGHOST
+          value: postgres.postgres.svc.cluster.local
+        - name: PGPORT
+          value: "5432"
+        - name: PGDATABASE
+          value: demo_noetl
+        - name: PGUSER
+          value: "demo"
+        - name: PGPASSWORD
+          value: "demo"
+        - name: EXECUTION_ID
+          value: "{{ execution_id }}"
+        - name: SCHEMA_NAME
+          value: container_test
     next:
       spec:
         mode: exclusive
@@ -115,30 +140,34 @@ workflow:
     desc: "Seed test data via container job"
     tool:
       kind: container
-      runtime:
-        provider: kubernetes
-        namespace: "{{ namespace }}"
-        image: "{{ image }}"
-        command: ["/bin/bash", "/workspace/seed_data.sh"]
-        serviceAccountName: noetl-worker
-        backoffLimit: 0
-        activeDeadlineSeconds: 600
-        cleanup: true
-        resources:
-          limits:
-            cpu: "500m"
-            memory: 512Mi
-          requests:
-            cpu: "100m"
-            memory: 128Mi
+      namespace: "{{ namespace }}"
+      image: "{{ image }}"
+      command: ["/bin/bash", "/workspace/seed_data.sh"]
+      service_account: noetl-worker
+      backoff_limit: 0
+      timeout_seconds: 600
+      resources:
+        limits:
+          cpu: "500m"
+          memory: 512Mi
+        requests:
+          cpu: "100m"
+          memory: 128Mi
       env:
-        PGHOST: postgres.postgres.svc.cluster.local
-        PGPORT: "5432"
-        PGDATABASE: demo_noetl
-        PGUSER: "demo"
-        PGPASSWORD: "demo"
-        EXECUTION_ID: "{{ execution_id }}"
-        SCHEMA_NAME: container_test
+        - name: PGHOST
+          value: postgres.postgres.svc.cluster.local
+        - name: PGPORT
+          value: "5432"
+        - name: PGDATABASE
+          value: demo_noetl
+        - name: PGUSER
+          value: "demo"
+        - name: PGPASSWORD
+          value: "demo"
+        - name: EXECUTION_ID
+          value: "{{ execution_id }}"
+        - name: SCHEMA_NAME
+          value: container_test
     next:
       spec:
         mode: exclusive

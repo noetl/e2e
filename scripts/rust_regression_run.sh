@@ -41,6 +41,7 @@ CORE_FIXTURES=(
   "fixtures/playbooks/data_transfer/http_iterator_save_postgres/http_iterator_save_postgres.yaml"
   "fixtures/playbooks/data_transfer/http_to_postgres_direct/http_to_postgres_direct.yaml"
   "fixtures/playbooks/data_transfer/http_to_postgres_simple/http_to_postgres_simple.yaml"
+  "fixtures/playbooks/data_transfer/http_to_postgres_transfer/http_to_postgres_transfer.yaml"
   "fixtures/playbooks/data_transfer/postgres_jsonb_test/postgres_jsonb_test.yaml"
   "fixtures/playbooks/duckdb_test.yaml"
   "fixtures/playbooks/fanout_reduce/fanout_reduce_phase6.yaml"
