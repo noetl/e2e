@@ -1,32 +1,50 @@
 #!/bin/bash
 set -euo pipefail
 
-# build.sh - Build and load container test image into Kind cluster
+# build.sh - Build and load the container test image into the Kind cluster.
 # Usage: ./build.sh [kind-cluster-name]
+#
+# Runtime-agnostic: uses whichever of docker / podman is on PATH.  When the
+# runtime is podman, `kind` is told to use its podman provider via
+# KIND_EXPERIMENTAL_PROVIDER so `kind load` targets the podman-backed node.
 
 CLUSTER_NAME="${1:-noetl}"
-IMAGE_NAME="noetl/postgres-container-test:latest"
+# Non-`latest` tag so Kubernetes defaults imagePullPolicy to IfNotPresent and
+# uses the kind-loaded image without attempting a registry pull (ai-meta#180).
+IMAGE_NAME="noetl/postgres-container-test:e2e"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Detect container runtime (docker preferred, podman fallback).
+if command -v docker >/dev/null 2>&1; then
+    RUNTIME="docker"
+elif command -v podman >/dev/null 2>&1; then
+    RUNTIME="podman"
+    export KIND_EXPERIMENTAL_PROVIDER=podman
+else
+    echo "ERROR: neither docker nor podman found on PATH"
+    exit 1
+fi
 
 echo "==================================================="
 echo "Container Test Image Build and Load"
 echo "==================================================="
-echo "Image: $IMAGE_NAME"
+echo "Image:   $IMAGE_NAME"
 echo "Cluster: $CLUSTER_NAME"
-echo "Build context: $SCRIPT_DIR"
+echo "Runtime: $RUNTIME"
+echo "Context: $SCRIPT_DIR"
 echo "==================================================="
 echo ""
 
-# Step 1: Build Docker image
-echo "Step 1: Building Docker image..."
-docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+# Step 1: Build image
+echo "Step 1: Building image..."
+"$RUNTIME" build -t "$IMAGE_NAME" "$SCRIPT_DIR"
 echo "✓ Image built successfully"
 echo ""
 
 # Step 2: Verify image exists
 echo "Step 2: Verifying local image..."
-if docker images "$IMAGE_NAME" | grep -q postgres-container-test; then
-    docker images "$IMAGE_NAME"
+if "$RUNTIME" images "$IMAGE_NAME" | grep -q postgres-container-test; then
+    "$RUNTIME" images "$IMAGE_NAME"
     echo "✓ Image verified locally"
 else
     echo "ERROR: Image not found locally"
@@ -55,9 +73,9 @@ echo ""
 
 # Step 5: Verify image in cluster
 echo "Step 5: Verifying image in cluster..."
-if docker exec -t "${CLUSTER_NAME}-control-plane" crictl images 2>/dev/null | grep -q postgres-container-test; then
+if "$RUNTIME" exec -t "${CLUSTER_NAME}-control-plane" crictl images 2>/dev/null | grep -q postgres-container-test; then
     echo "✓ Image available in cluster"
-    docker exec -t "${CLUSTER_NAME}-control-plane" crictl images | grep postgres-container-test
+    "$RUNTIME" exec -t "${CLUSTER_NAME}-control-plane" crictl images | grep postgres-container-test
 else
     echo "WARNING: Could not verify image in cluster (may require admin permissions)"
 fi
@@ -68,7 +86,8 @@ echo "Build and load completed successfully!"
 echo "==================================================="
 echo ""
 echo "Next steps:"
-echo "  1. Register playbook: noetl register playbook fixtures/playbooks/container_postgres_init/"
-echo "  2. Execute playbook: noetl execute test/container/postgres_init"
-echo "  3. Verify results: Check execution status in NoETL API"
+echo "  1. Register + run via the regression runner:"
+echo "     scripts/rust_regression_run.sh <server-url> \\"
+echo "       <(echo fixtures/playbooks/container_postgres_init/container_postgres_init.yaml)"
+echo "  2. Or register: noetl register playbook fixtures/playbooks/container_postgres_init/"
 echo ""
