@@ -1,6 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
+# PGPORT is intentionally NOT passed as a container env var by the fixture:
+# the NoETL server coerces pure-numeric env string values to JSON numbers,
+# which the container tool rejects (ContainerEnvVar.value is a String).
+# Default it here so libpq/psql target 5432 (the in-cluster Postgres port).
+# See noetl/ai-meta#186.
+export PGPORT="${PGPORT:-5432}"
+
 # init_schema.sh - Initialize PostgreSQL schema via container
 # This script demonstrates credential passing from NoETL to container jobs
 # Environment variables are injected by the container tool runtime
