@@ -55,7 +55,7 @@ noetl catalog register fixtures/playbooks/postgres_excel_gcs_test/postgres_excel
 
 ### Execute Test
 ```bash
-noetl execute tests/postgres_excel_gcs
+noetl run tests/postgres_excel_gcs
 ```
 
 ### Validate Results

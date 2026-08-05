@@ -39,7 +39,7 @@ This fixture demonstrates how NoETL can orchestrate an NVIDIA CUDA-Q quantum sim
 3. Execute it with overrides for your environment, e.g.:
 
    ```bash
-   noetl execute tests/quantum/cudaq_ai_pipeline \
+   noetl run tests/quantum/cudaq_ai_pipeline \
      --host localhost --port 8082 \
      --set problem_catalog_url=https://demo.lab/api/problems \
      --set problem_id=maxcut-16 \
