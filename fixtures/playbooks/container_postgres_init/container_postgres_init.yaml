@@ -1,20 +1,30 @@
 # ============================================================================
-# KNOWN-SKIP — not in the active regression suite.
+# KNOWN-SKIP — container-based Postgres schema-init fixture (noetl/ai-meta#180).
 #
-# Blocker: the container steps run the custom image
-# `noetl/postgres-container-test` (build context: this directory's build.sh +
-# init_schema.sh / create_tables.sh / seed_data.sh).  That image is NOT present
-# in the local kind cluster and is not published to a registry kind can pull,
-# so the container Jobs fail ImagePullBackOff.
+# Image blocker (the original #180 scope) is RESOLVED: build.sh now builds
+# `noetl/postgres-container-test:e2e` (podman or docker) and loads it into the
+# local kind cluster.  The non-`latest` tag makes Kubernetes default
+# `imagePullPolicy` to `IfNotPresent`, so the loaded image is used without a
+# registry pull.  To (re)build + load before a run:
+#   ./build.sh            # podman/docker build + kind load into cluster `noetl`
+# The container steps run and create the schema/tables/seed data against the
+# in-cluster Postgres (postgres.postgres.svc.cluster.local, db demo_noetl,
+# user demo) — verified when timing allows.
 #
-# The DSL below has been modernized to the current `kind: container` syntax
-# (flat snake_case config, `env:` as a `[{name, value}]` array — the shape the
-# Rust container tool's ContainerConfig deserializes) so the fixture no longer
-# carries stale `runtime:`-nested / camelCase drift.  To make it green:
-#   1. Build + load the image:  ./build.sh  then
-#      `kind load docker-image noetl/postgres-container-test:latest --name noetl`
-#   2. Add the path back to CORE_FIXTURES in scripts/rust_regression_run.sh.
-# See noetl/e2e RUST_REGRESSION.md "Known-skip fixtures" + the follow-up issue.
+# STILL BLOCKED on a container-tool platform bug (tracked in noetl/ai-meta#186):
+# a `kind: container` step returns pending_callback (the Job runs async), but
+# the orchestrator advances the DAG on that initial success instead of waiting
+# for the Job's completion resume.  So the dependent postgres `verify_data`
+# step (and each successive container step) races ahead of the prior Job's
+# commit and fails with `42P01 relation ... does not exist`.  This cannot be
+# fixed in the fixture; it needs an orchestrate-core/worker change.
+#
+# Two container-tool config bugs surfaced here were worked around at the
+# fixture level so the config parses (also folded into #186):
+#   * `args: []` on each container step — the worker injects the step input
+#     MAP into `args` when absent, which the tool's Vec<String> rejects.
+#   * PGPORT dropped + EXECUTION_ID prefixed — the server coerces pure-numeric
+#     env string values to JSON numbers, which the tool's String value rejects.
 # ============================================================================
 apiVersion: noetl.io/v2
 kind: Playbook
@@ -33,7 +43,7 @@ tracing:
 workload:
   pg_auth: pg_k8s  # Use pg_k8s for cluster, pg_local for local testing
   namespace: noetl
-  image: noetl/postgres-container-test:latest
+  image: noetl/postgres-container-test:e2e
   message: "Container-based PostgreSQL schema initialization test"
 
 workflow:
@@ -69,6 +79,11 @@ workflow:
       namespace: "{{ namespace }}"
       image: "{{ image }}"
       command: ["/bin/bash", "/workspace/init_schema.sh"]
+      # Declare args explicitly (empty) so the worker does NOT inject the step
+      # input map into `args` — the container tool's ContainerConfig.args is a
+      # Vec<String>, and an injected map fails deserialization ("invalid type:
+      # map, expected a sequence").  See noetl/ai-meta#186.
+      args: []
       service_account: noetl-worker
       backoff_limit: 0
       timeout_seconds: 600
@@ -82,8 +97,6 @@ workflow:
       env:
         - name: PGHOST
           value: postgres.postgres.svc.cluster.local
-        - name: PGPORT
-          value: "5432"
         - name: PGDATABASE
           value: demo_noetl
         - name: PGUSER
@@ -91,7 +104,7 @@ workflow:
         - name: PGPASSWORD
           value: "demo"
         - name: EXECUTION_ID
-          value: "{{ execution_id }}"
+          value: "exec-{{ execution_id }}"
     next:
       spec:
         mode: exclusive
@@ -105,6 +118,7 @@ workflow:
       namespace: "{{ namespace }}"
       image: "{{ image }}"
       command: ["/bin/bash", "/workspace/create_tables.sh"]
+      args: []  # see run_schema_creation — avoids worker args-injection (ai-meta#186)
       service_account: noetl-worker
       backoff_limit: 0
       timeout_seconds: 600
@@ -118,8 +132,6 @@ workflow:
       env:
         - name: PGHOST
           value: postgres.postgres.svc.cluster.local
-        - name: PGPORT
-          value: "5432"
         - name: PGDATABASE
           value: demo_noetl
         - name: PGUSER
@@ -127,7 +139,7 @@ workflow:
         - name: PGPASSWORD
           value: "demo"
         - name: EXECUTION_ID
-          value: "{{ execution_id }}"
+          value: "exec-{{ execution_id }}"
         - name: SCHEMA_NAME
           value: container_test
     next:
@@ -143,6 +155,7 @@ workflow:
       namespace: "{{ namespace }}"
       image: "{{ image }}"
       command: ["/bin/bash", "/workspace/seed_data.sh"]
+      args: []  # see run_schema_creation — avoids worker args-injection (ai-meta#186)
       service_account: noetl-worker
       backoff_limit: 0
       timeout_seconds: 600
@@ -156,8 +169,6 @@ workflow:
       env:
         - name: PGHOST
           value: postgres.postgres.svc.cluster.local
-        - name: PGPORT
-          value: "5432"
         - name: PGDATABASE
           value: demo_noetl
         - name: PGUSER
@@ -165,7 +176,7 @@ workflow:
         - name: PGPASSWORD
           value: "demo"
         - name: EXECUTION_ID
-          value: "{{ execution_id }}"
+          value: "exec-{{ execution_id }}"
         - name: SCHEMA_NAME
           value: container_test
     next:
