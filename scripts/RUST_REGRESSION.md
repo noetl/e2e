@@ -187,6 +187,33 @@ without clearing the blocker.
 | --- | --- |
 | `fixtures/playbooks/spike/spike_e2e_test.yaml` | Uses `tool: agent` + `framework: noetl` (step `trigger_failure`). `kind: agent` is **not** a Rust `ToolDefinition` variant — there is no `agent.rs`. The NoETL-as-AI-OS agent-framework spike (auto-dispatch-on-failure, self-troubleshoot agent, Ollama triage bridge) was never ported to the Rust engine. Kept in-tree as documentation of the retired capability, not as a runnable test. Revive only if the agent framework is ported. |
 
+### Un-skipped 2026-08-05 — `container_postgres_init`
+
+Runnable. It was the only fixture exercising `kind: container` end-to-end with
+`env:` and cross-step data dependencies, and it stayed skipped through two
+distinct blockers:
+
+1. **The image never loaded on podman.** `kind load docker-image` looks the image
+   up by the exact name; podman qualifies a locally-built `noetl/...` as
+   `docker.io/noetl/...`, so the load failed seconds after the build succeeded.
+   podman is this project's runtime — `noetl-dev` has no docker — so nobody
+   following the setup could build it (noetl/e2e#91).
+2. **The DAG did not gate on container completion**
+   ([noetl/ai-meta#186](https://github.com/noetl/ai-meta/issues/186) Bug 1).
+   Fixed in server **v3.64.1**; see that issue for the root cause.
+
+**Requirements to run it:**
+
+- server **>= 3.64.1** — earlier builds dispatch every container step at once.
+- A completion path: either the external `noetl-k8s-watcher`, or
+  `NOETL_CONTAINER_COMPLETION_POLL=true` on the worker. ⚠ The flag accepts only
+  `1`/`true`/`yes`/`on`; a cadence-looking value such as `2` silently means OFF
+  and the execution parks forever (worker warns as of noetl/worker#231).
+
+Verified on kind with released multi-arch images (server 3.64.1 / worker 5.97.0):
+Jobs created at +0s / +7s / +15s, each after its predecessor completed, and a
+deliberate container failure produced `FAILED` rather than `COMPLETED`.
+
 ### Known-skip (blocked on a missing dependency — DSL modernized, not yet runnable)
 
 DSL modernized to current Rust syntax so they no longer carry stale drift, but
@@ -194,6 +221,5 @@ left out of the suite pending the dependency. One follow-up issue each.
 
 | Fixture | Blocker | Follow-up |
 | --- | --- | --- |
-| `fixtures/playbooks/container_postgres_init/container_postgres_init.yaml` | Image blocker RESOLVED (`build.sh` builds `noetl/postgres-container-test:e2e` via podman/docker + `kind load`; non-`latest` tag → `imagePullPolicy: IfNotPresent`). Container steps now run and create schema/tables/seed. STILL BLOCKED: `kind: container` steps set `pending_callback` but the orchestrator advances the DAG on the initial success instead of the Job-completion resume, so `verify_data` races ahead and fails `42P01`. Two tool-config bugs (worker injects step-input map into `args`; server coerces numeric env strings to JSON numbers) worked around in-fixture (`args: []`, PGPORT dropped, EXECUTION_ID prefixed). | noetl/ai-meta#180 (image); noetl/ai-meta#186 (container-tool platform bugs) |
 | `fixtures/playbooks/tradedb/tradedb_create_db.yaml` | DDL lives in absent private IQT submodule (`./submodules/IQT/scripts/tradedb/create_tradedb.sql`). DSL modernized: `script:{uri,source:{type:file}}` + `with:` → inline `command:` (placeholder body). | noetl/ai-meta#181 |
 | `fixtures/playbooks/tradedb/tradedb_bootstrap.yaml` | DDL + dictionaries SQL in absent private IQT submodule. DSL modernized as above (two steps). | noetl/ai-meta#182 |
