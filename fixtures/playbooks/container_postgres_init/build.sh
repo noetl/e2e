@@ -67,7 +67,22 @@ echo ""
 
 # Step 4: Load image into Kind
 echo "Step 4: Loading image into Kind cluster..."
-kind load docker-image "$IMAGE_NAME" --name "$CLUSTER_NAME"
+# `kind load docker-image` looks the image up by the exact name given.  podman
+# stores a locally-built `noetl/...` image fully qualified as
+# `docker.io/noetl/...`, so the unqualified name misses and kind reports
+# `ERROR: image: "noetl/postgres-container-test:e2e" not present locally`
+# even though the build succeeded moments earlier.
+#
+# Going through an archive sidesteps the name lookup entirely and behaves the
+# same on both runtimes, so there is one path to keep working rather than two.
+TAR="$(mktemp -t noetl-fixture-image-XXXXXX).tar"
+trap 'rm -f "$TAR"' EXIT
+if ! "$RUNTIME" save "$IMAGE_NAME" -o "$TAR" 2>/dev/null; then
+    # podman needs the qualified name for `save` when the image was built
+    # locally under an implicit docker.io prefix.
+    "$RUNTIME" save "docker.io/$IMAGE_NAME" -o "$TAR"
+fi
+kind load image-archive "$TAR" --name "$CLUSTER_NAME"
 echo "✓ Image loaded into cluster"
 echo ""
 
