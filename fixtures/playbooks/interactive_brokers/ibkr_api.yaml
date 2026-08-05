@@ -8,10 +8,10 @@
 # - Market data queries
 #
 # Usage (via server):
-#   noetl execute automation/ibkr/api --payload '{"target": "status"}'
-#   noetl execute automation/ibkr/api --payload '{"target": "accounts"}'
-#   noetl execute automation/ibkr/api --payload '{"target": "positions"}'
-#   noetl execute automation/ibkr/api --payload '{"target": "totp"}'
+#   noetl run automation/ibkr/api --payload '{"target": "status"}'
+#   noetl run automation/ibkr/api --payload '{"target": "accounts"}'
+#   noetl run automation/ibkr/api --payload '{"target": "positions"}'
+#   noetl run automation/ibkr/api --payload '{"target": "totp"}'
 #
 # Prerequisites:
 #   1. Register credential: noetl register credential ib_gateway -f fixtures/credentials/ib_gateway.json
