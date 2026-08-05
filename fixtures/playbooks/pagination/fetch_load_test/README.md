@@ -32,14 +32,14 @@ curl "http://localhost:30555/api/v1/patient-records?patientId=P-0001&page=1&page
 
 ```bash
 # Standard run (max_in_flight: 5 — production readiness check)
-noetl exec fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml
+noetl run fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml
 
 # Override patient count for a quick smoke test
-noetl exec fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml \
+noetl run fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml \
   --var num_patients=20
 
 # Reproduce the crash: override max_in_flight to 20 via --var
-noetl exec fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml \
+noetl run fixtures/playbooks/pagination/fetch_load_test/test_fetch_load.yaml \
   --var max_in_flight=20
 # Expected: CrashLoopBackOff or OOM kill within the first few minutes
 ```

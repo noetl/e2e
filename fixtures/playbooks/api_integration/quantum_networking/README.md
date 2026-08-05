@@ -20,7 +20,7 @@ The playbook executes a simple Bell-state workflow relevant to quantum networkin
 ## Quick run (local NoETL)
 
 ```bash
-noetl exec fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local
+noetl run fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local
 ```
 
 Default provider is `nvidia_simulator`.
@@ -40,7 +40,7 @@ pip install qiskit qiskit-aer
 CPU/default device:
 
 ```bash
-noetl exec fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local \
+noetl run fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local \
   --set provider=nvidia_simulator \
   --set shots=1024
 ```
@@ -49,7 +49,7 @@ Request GPU device in Aer:
 
 ```bash
 export NVIDIA_USE_GPU=true
-noetl exec fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local \
+noetl run fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local \
   --set provider=nvidia_simulator \
   --set shots=4096
 ```
@@ -78,7 +78,7 @@ export IBM_QUANTUM_API_VERSION="2024-06-13"
 ### Run command
 
 ```bash
-noetl exec fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local \
+noetl run fixtures/playbooks/api_integration/quantum_networking/quantum_networking_runner.yaml -r local \
   --set provider=ibm_api
 ```
 

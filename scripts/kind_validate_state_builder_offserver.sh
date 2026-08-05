@@ -217,7 +217,7 @@ print(",".join("%s:%s" % (r.get("nn"), r.get("c")) for r in sorted(d, key=lambda
 # discard them).
 run_leg() {  # label
   noetl register playbook --file "$FIXTURE_PATH" >/dev/null
-  LEG_EID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
+  LEG_EID="$(noetl run "$PLAYBOOK_PATH" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   echo "kind-val: $1 leg launched execution_id=$LEG_EID"
   local deadline=$(( SECONDS + TIMEOUT_SECS ))

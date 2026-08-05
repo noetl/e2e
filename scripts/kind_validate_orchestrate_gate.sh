@@ -191,7 +191,7 @@ echo "kind-val: register + execute fanout_reduce_phase6 (gate-on, off-server dri
 echo "================================================================"
 
 noetl register playbook --file "$FIXTURE_PATH"
-EXECUTION_ID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
+EXECUTION_ID="$(noetl run "$PLAYBOOK_PATH" --runtime distributed --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
 echo "kind-val: launched execution_id=$EXECUTION_ID"
 

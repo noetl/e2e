@@ -179,7 +179,7 @@ run_probe() {
   noetl register playbook --file "$FIXTURE_DIR/$path"
 
   local execution_id
-  execution_id=$(noetl exec "$catalog_path" --runtime distributed --json \
+  execution_id=$(noetl run "$catalog_path" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')
   echo "kind-val: launched execution_id=$execution_id"
 

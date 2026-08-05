@@ -157,7 +157,7 @@ print(d[0].get("v", "") if d else "")'
 
 launch_running_exec() {  # -> prints execution_id; waits until it has progressed
   local eid
-  eid="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
+  eid="$(noetl run "$PLAYBOOK_PATH" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   # Wait until the execution is actually moving (a command exists), so the
   # cancel/finalize lands on a live RUNNING execution, not a not-yet-dispatched

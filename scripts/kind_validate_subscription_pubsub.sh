@@ -115,7 +115,7 @@ echo "================================================================"
 noetl register credential -f "$CRED_FILE"
 noetl register playbook --file "$FIXTURE_PATH"
 
-EXECUTION_ID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed \
+EXECUTION_ID="$(noetl run "$PLAYBOOK_PATH" --runtime distributed \
   --set "subscription=$SUBSCRIPTION" --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
 echo "kind-val: launched execution_id=$EXECUTION_ID"

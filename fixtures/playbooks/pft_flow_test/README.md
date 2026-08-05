@@ -116,13 +116,13 @@ patients. MDS expected/detail counts must match.
 Use the catalog path without the `.yaml` extension:
 
 ```bash
-noetl exec fixtures/playbooks/pft_flow_test/test_pft_flow --runtime distributed
+noetl run fixtures/playbooks/pft_flow_test/test_pft_flow --runtime distributed
 ```
 
 For smaller smoke runs, override workload values:
 
 ```bash
-noetl exec fixtures/playbooks/pft_flow_test/test_pft_flow \
+noetl run fixtures/playbooks/pft_flow_test/test_pft_flow \
   --runtime distributed \
   --payload '{"num_facilities":1,"patients_per_facility":100,"pft_batch_size":25,"pft_batch_concurrency":4}'
 ```
