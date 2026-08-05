@@ -228,7 +228,7 @@ echo "================================================================"
 
 noetl register playbook --file "$FIXTURE_PATH"
 
-EXECUTION_ID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
+EXECUTION_ID="$(noetl run "$PLAYBOOK_PATH" --runtime distributed --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
 echo "kind-val: launched execution_id=$EXECUTION_ID"
 
@@ -348,7 +348,7 @@ else
   REF_RESOLVED_BEFORE="$(metrics_drive ref_resolved "$(fetch_metrics)")"
 
   noetl register playbook --file "$LARGE_FIXTURE_PATH"
-  LARGE_EID="$(noetl exec "$LARGE_PLAYBOOK_PATH" --runtime distributed --json \
+  LARGE_EID="$(noetl run "$LARGE_PLAYBOOK_PATH" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   echo "kind-val: large-context execution_id=$LARGE_EID"
 
@@ -436,7 +436,7 @@ else
   CTX_RESOLVED_BEFORE="$(metrics_drive context_ref_resolved "$(fetch_metrics)")"
 
   noetl register playbook --file "$OVERSIZE_FIXTURE_PATH"
-  OVERSIZE_EID="$(noetl exec "$OVERSIZE_PLAYBOOK_PATH" --runtime distributed --json \
+  OVERSIZE_EID="$(noetl run "$OVERSIZE_PLAYBOOK_PATH" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   echo "kind-val: oversized-context execution_id=$OVERSIZE_EID"
 

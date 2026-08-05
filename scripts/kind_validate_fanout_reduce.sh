@@ -128,7 +128,7 @@ noetl register playbook --file "$FIXTURE_PATH"
 # Exec by the catalog *path* (metadata.path), not the bare name —
 # distributed runtime resolves the path against the catalog.
 # `--json` emits a single JSON object: {"execution_id": ..., ...}.
-EXECUTION_ID="$(noetl exec "$PLAYBOOK_PATH" --runtime distributed --json \
+EXECUTION_ID="$(noetl run "$PLAYBOOK_PATH" --runtime distributed --json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
 echo "kind-val: launched execution_id=$EXECUTION_ID"
 

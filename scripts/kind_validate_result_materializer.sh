@@ -134,7 +134,7 @@ print(d[0].get("n", 0) if d else 0)'
 # Runs one execution leg.  Sets globals LEG_EID + LEG_STATUS.
 run_leg() {  # fixture_file catalog_path label
   noetl register playbook --file "$1" >/dev/null
-  LEG_EID="$(noetl exec "$2" --runtime distributed --json \
+  LEG_EID="$(noetl run "$2" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   echo "kind-val: $3 leg launched execution_id=$LEG_EID"
   local deadline=$(( SECONDS + TIMEOUT_SECS ))

@@ -304,7 +304,7 @@ run_fixture() {
   # $1 = fixture path, $2 = playbook path → prints execution_id (or empty)
   local fpath="$1" ppath="$2"
   noetl register playbook --file "$fpath" >/dev/null 2>&1 || true
-  noetl exec "$ppath" --runtime distributed --json 2>/dev/null \
+  noetl run "$ppath" --runtime distributed --json 2>/dev/null \
     | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["execution_id"])
 except Exception: print("")'
@@ -365,7 +365,7 @@ if [[ "$FANOUT_BURST" -gt 0 ]]; then
   echo "kind-val: #117 fan-out burst × $FANOUT_BURST (concurrent fanout_reduce — id-inversion stress)"
   noetl register playbook --file "$FO_FIXTURE" >/dev/null 2>&1 || true
   for ((b=1; b<=FANOUT_BURST; b++)); do
-    eid="$(noetl exec "$FO_PATH" --runtime distributed --json 2>/dev/null \
+    eid="$(noetl run "$FO_PATH" --runtime distributed --json 2>/dev/null \
       | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["execution_id"])
 except Exception: print("")')"

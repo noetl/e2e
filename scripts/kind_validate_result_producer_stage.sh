@@ -165,7 +165,7 @@ roll() { "${KCTX[@]}" rollout status deploy/"$1" --timeout=150s >/dev/null 2>&1 
 
 run_leg() {  # label -> sets LEG_EID, LEG_STATUS, LEG_OUT
   noetl register playbook --file "${FIX%%:*}" >/dev/null
-  LEG_EID="$(noetl exec "${FIX##*:}" --runtime distributed --json \
+  LEG_EID="$(noetl run "${FIX##*:}" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   echo "kind-val: $1 leg launched execution_id=$LEG_EID"
   local deadline=$(( SECONDS + TIMEOUT_SECS ))

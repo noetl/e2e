@@ -201,7 +201,7 @@ await_tier() {  # eid — block until charge's tier object is written (or timeou
 
 launch_leg() {  # -> sets LEG_EID
   noetl register playbook --file "${FIX%%:*}" >/dev/null
-  LEG_EID="$(noetl exec "${FIX##*:}" --runtime distributed --json \
+  LEG_EID="$(noetl run "${FIX##*:}" --runtime distributed --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["execution_id"])')"
   echo "kind-val: leg launched execution_id=$LEG_EID"
 }
