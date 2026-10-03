@@ -15,10 +15,10 @@ const config: Config = {
   baseUrl: '/',
   organizationName: 'noetl',
   projectName: 'e2e',
-  onBrokenLinks: 'warn',
+  onBrokenLinks: 'throw',
   markdown: {
     hooks: {
-      onBrokenMarkdownLinks: 'warn',
+      onBrokenMarkdownLinks: 'throw',
     },
   },
 

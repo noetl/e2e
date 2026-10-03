@@ -1,0 +1,92 @@
+# noetl/ai-meta#375 — this repo's only workflow published a container image on a
+# push to main, so NOTHING gated a pull request: a broken fixture, manifest or
+# script merged clean and surfaced later when someone ran the suite.
+#
+# Four steps, each failing for a distinguishable reason so the job log says what
+# broke rather than just that something did.
+#
+# Two properties worth preserving if you edit ci/checks/validate.py:
+#   * Populations are DISCOVERED, never enumerated — a hardcoded list drifts the
+#     moment someone adds a fixture, and partial coverage emits no error at all.
+#   * Every check prints its denominator and fails below a floor, because
+#     "0 failures" is also what a check that examined nothing looks like.
+#     Proven: run it in an empty repo and all three checks fail on their floor.
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install PyYAML
+        run: pip install --quiet pyyaml
+      - name: validate fixtures, manifests and scripts
+        run: python3 ci/checks/validate.py
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # scripts/generate_playbook_docs.py imports yaml, so the docs job needs
+      # PyYAML as much as the files job does.  Omitting it here failed the first
+      # CI run of this workflow with ModuleNotFoundError -- invisible locally,
+      # where yaml was already importable.
+      - name: install PyYAML
+        run: pip install --quiet pyyaml
+
+      - run: npm ci --no-audit --no-fund
+
+      # `docs/playbooks/**` is GENERATED from fixtures/playbooks by
+      # scripts/generate_playbook_docs.py, and `npm run build` regenerates it
+      # before building.  That means the SITE is always correct while the
+      # committed copies can quietly rot -- and they had: the committed index
+      # claimed 144 playbooks against 162 on disk, with seven whole categories
+      # missing.  Nobody reading the site would notice; anyone reading the repo
+      # would.
+      #
+      # This step makes the generated files a checked artifact: regenerate, and
+      # fail if that produces a diff.  `--exit-code` on a `git diff` that
+      # includes untracked files is the point -- the previous drift was mostly
+      # whole files that had never been added, which a plain `git diff` does not
+      # see.
+      - name: generated playbook docs are current
+        run: |
+          npm run docs:generate
+          if [ -n "$(git status --porcelain docs/)" ]; then
+            echo "::error::docs/playbooks is stale -- run 'npm run docs:generate' and commit the result"
+            git status --porcelain docs/
+            git --no-pager diff -- docs/
+            exit 1
+          fi
+          echo "generated docs match fixtures"
+
+      # onBrokenLinks/onBrokenMarkdownLinks are 'throw' as of noetl/ai-meta#375.
+      # They were 'warn', which meant a build could not fail on a broken link and
+      # this step would have gated nothing but compile errors.  The count was
+      # measured at 0 before the flip, so it starts green; proven to fail by
+      # planting one broken link.
+      - name: build the site
+        run: npm run build
