@@ -49,6 +49,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      # scripts/generate_playbook_docs.py imports yaml, so the docs job needs
+      # PyYAML as much as the files job does.  Omitting it here failed the first
+      # CI run of this workflow with ModuleNotFoundError -- invisible locally,
+      # where yaml was already importable.
+      - name: install PyYAML
+        run: pip install --quiet pyyaml
+
       - run: npm ci --no-audit --no-fund
 
       # `docs/playbooks/**` is GENERATED from fixtures/playbooks by
