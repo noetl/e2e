@@ -7,7 +7,8 @@ Playbooks in `batch_execution`.
 
 | Catalog path | Fixture file | Description | Tools |
 | --- | --- | --- | --- |
-| `batch_execution/multi_playbook_batch` | `fixtures/playbooks/batch_execution/multi_playbook_batch/multi_playbook_batch.yaml` | - | duckdb, playbook, python |
+| `batch_execution/multi_playbook_batch` | `fixtures/playbooks/batch_execution/multi_playbook_batch/multi_playbook_batch.yaml` | - | playbook, postgres, python |
+| `fixtures/playbooks/batch_execution/frame_heartbeat_regression` | `fixtures/playbooks/batch_execution/frame_heartbeat_regression/frame_heartbeat_regression.yaml` | Regression coverage for long-running cursor frames.  The cursor stage intentionally uses frame.process=frame and calls a slow mock HTTP endpoint for longer than the default 120s frame lease. The expected behavior is that the cursor worker emits frame heartbeats while the frame task is still running, allowing the frame to commit instead of becoming ABANDONED.  | postgres, python |
 | `fixtures/playbooks/batch_execution/heavy_payload_pipeline_chunk_worker` | `fixtures/playbooks/batch_execution/heavy_payload_pipeline_chunk_worker/heavy_payload_pipeline_chunk_worker.yaml` | Process one chunk of IDs and run per-item heavy task-sequence pipeline. | postgres, python |
 | `fixtures/playbooks/batch_execution/heavy_payload_pipeline_in_step` | `fixtures/playbooks/batch_execution/heavy_payload_pipeline_in_step/heavy_payload_pipeline_in_step.yaml` | Simulate large per-item pipeline payloads and compare direct stress vs chunked processing. | playbook, postgres, python |
 | `fixtures/playbooks/batch_execution/heavy_payload_pipeline_in_step_parallel` | `fixtures/playbooks/batch_execution/heavy_payload_pipeline_in_step_parallel/heavy_payload_pipeline_in_step_parallel.yaml` | Simulate large per-item pipeline payloads with parallel chunk-worker orchestration. | playbook, postgres, python |
