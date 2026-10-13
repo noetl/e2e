@@ -287,11 +287,9 @@ CREATE TRIGGER trg_playbook_perms_updated_at
 
 -- Insert default roles
 INSERT INTO auth.roles (role_name, description, is_system_role)
-VALUES 
-    ('admin', 'Full system access', true),
-    ('developer', 'Create and manage playbooks', true),
-    ('analyst', 'Execute playbooks and view results', true),
-    ('viewer', 'View playbooks and execution history', true)
+VALUES
+    -- Two roles only: admin, and the regular user, who holds no role.
+    ('admin', 'Full system access', true)
 ON CONFLICT (role_name) DO NOTHING;
 
 -- Insert default permissions
@@ -319,63 +317,11 @@ CROSS JOIN auth.permissions p
 WHERE r.role_name = 'admin'
 ON CONFLICT DO NOTHING;
 
--- Assign permissions to developer role
-INSERT INTO auth.role_permissions (role_id, permission_id)
-SELECT r.role_id, p.permission_id
-FROM auth.roles r
-JOIN auth.permissions p ON p.permission_name IN (
-    'playbook:execute', 'playbook:view', 'playbook:create', 'playbook:modify',
-    'catalog:view', 'credential:view', 'execution:view'
-)
-WHERE r.role_name = 'developer'
-ON CONFLICT DO NOTHING;
-
--- Assign permissions to analyst role
-INSERT INTO auth.role_permissions (role_id, permission_id)
-SELECT r.role_id, p.permission_id
-FROM auth.roles r
-JOIN auth.permissions p ON p.permission_name IN (
-    'playbook:execute', 'playbook:view', 'execution:view'
-)
-WHERE r.role_name = 'analyst'
-ON CONFLICT DO NOTHING;
-
--- Assign permissions to viewer role
-INSERT INTO auth.role_permissions (role_id, permission_id)
-SELECT r.role_id, p.permission_id
-FROM auth.roles r
-JOIN auth.permissions p ON p.permission_name IN (
-    'playbook:view', 'execution:view'
-)
-WHERE r.role_name = 'viewer'
-ON CONFLICT DO NOTHING;
-
 -- Grant admin full playbook access
 INSERT INTO auth.playbook_permissions (role_id, playbook_path, can_execute, can_view, can_modify, allow_pattern)
 SELECT role_id, '%', true, true, true, '%'
 FROM auth.roles
 WHERE role_name = 'admin'
-ON CONFLICT DO NOTHING;
-
--- Grant developer access to non-system playbooks
-INSERT INTO auth.playbook_permissions (role_id, playbook_path, can_execute, can_view, can_modify, allow_pattern, deny_pattern)
-SELECT role_id, '%', true, true, true, '%', 'system/%'
-FROM auth.roles
-WHERE role_name = 'developer'
-ON CONFLICT DO NOTHING;
-
--- Grant analyst execute access
-INSERT INTO auth.playbook_permissions (role_id, playbook_path, can_execute, can_view, can_modify, allow_pattern)
-SELECT role_id, '%', true, true, false, 'data/%'
-FROM auth.roles
-WHERE role_name = 'analyst'
-ON CONFLICT DO NOTHING;
-
--- Grant viewer read-only access
-INSERT INTO auth.playbook_permissions (role_id, playbook_path, can_execute, can_view, can_modify, allow_pattern)
-SELECT role_id, '%', false, true, false, '%'
-FROM auth.roles
-WHERE role_name = 'viewer'
 ON CONFLICT DO NOTHING;
 
 -- ============================================================================
