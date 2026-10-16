@@ -146,12 +146,9 @@ workflow:
         CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON auth.audit_log(user_id);
         CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON auth.audit_log(created_at);
 
-        -- Seed default roles
+        -- Seed roles. Two roles only: admin, and the regular user, who holds no role.
         INSERT INTO auth.roles (role_name, description) VALUES
-          ('admin', 'Administrator with full access'),
-          ('developer', 'Developer with playbook execution rights'),
-          ('analyst', 'Analyst with read-only access'),
-          ('viewer', 'Viewer with limited read access')
+          ('admin', 'Administrator with full access')
         ON CONFLICT (role_name) DO NOTHING;
 
         -- Seed default permissions
@@ -171,14 +168,6 @@ workflow:
         FROM auth.roles r
         CROSS JOIN auth.permissions p
         WHERE r.role_name = 'admin'
-        ON CONFLICT DO NOTHING;
-
-        INSERT INTO auth.role_permissions (role_id, permission_id)
-        SELECT r.role_id, p.permission_id
-        FROM auth.roles r
-        CROSS JOIN auth.permissions p
-        WHERE r.role_name = 'developer'
-          AND p.permission_name IN ('playbook:execute', 'playbook:view', 'catalog:read')
         ON CONFLICT DO NOTHING;
 
         SELECT 'Auth schema provisioned successfully' as result;
