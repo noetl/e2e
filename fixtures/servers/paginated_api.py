@@ -1057,14 +1057,22 @@ def _pft_facility_mapping_id(patient_id: int, patients_per_facility: int) -> int
     return ((patient_id - 1) // max(1, patients_per_facility)) + 1
 
 
-# === BENCHMARK-ONLY RE-ENABLE (local kind, NOT for commit) ===
-# Restores the original #14 comma-separated PFT batch handler so the batch
-# fixture (test_pft_flow.yaml) can run the #120 end-to-end throughput
-# benchmark. The committed default of this endpoint is 410 Gone
-# (get_pft_batch_disabled). Do NOT commit this change. Revert to 410 after
-# benchmarking. No internal rate-limit on the batch path — matches the
-# conditions under which the historical ~54s-kind / ~1m53s-GKE 10k baseline
-# was measured.
+# === PFT batch endpoint: 410 Gone by default, opt-in benchmark mode ===
+# The committed contract (#23) is that PFT emulates the real API: one HTTP
+# request returns one record, so /api/v1/pft/batch/{data_type} answers
+# 410 Gone (get_pft_batch_disabled). The ops dev playbook verifies this on
+# every test-server deploy.
+#
+# The original #14 comma-separated batch handler (get_pft_batch) is kept for
+# the #120 end-to-end throughput benchmark (test_pft_flow.yaml), but it is
+# only routed when PFT_BATCH_BENCHMARK is truthy in the server's environment.
+# It used to be re-enabled by editing this file locally, and that edit was
+# committed by accident in 39dc880, silently breaking the 410 contract.
+# No internal rate-limit on the benchmark path — matches the conditions under
+# which the historical ~54s-kind / ~1m53s-GKE 10k baseline was measured.
+PFT_BATCH_BENCHMARK = os.getenv("PFT_BATCH_BENCHMARK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _pft_batch_patient_ids(patientIds: str) -> list:
     ids: list = []
     for raw in patientIds.split(","):
@@ -1079,7 +1087,6 @@ def _pft_batch_patient_ids(patientIds: str) -> list:
     return ids
 
 
-@app.get('/api/v1/pft/batch/{data_type}')
 def get_pft_batch(
     data_type: str,
     patientIds: str = Query(..., description="Comma-separated patient IDs"),
@@ -1162,7 +1169,29 @@ def get_pft_batch(
         "rowCount": len(rows),
         "rows": rows,
     }
-# === END BENCHMARK-ONLY RE-ENABLE ===
+
+
+def get_pft_batch_disabled(data_type: str):
+    """Reject fixture-side batching for PFT.
+
+    Keep this intentionally disabled: PFT must emulate the real API contract
+    where every HTTP request returns exactly one record. Do not reintroduce
+    repeated IDs, comma-separated IDs, or multi-record response optimizations.
+    """
+    _enforce_pft_rate_limit()
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "PFT batch endpoints are disabled; use the singular per-record "
+            "endpoints so 1 HTTP request returns 1 record."
+        ),
+    )
+
+
+app.get('/api/v1/pft/batch/{data_type}')(
+    get_pft_batch if PFT_BATCH_BENCHMARK else get_pft_batch_disabled
+)
+# === END PFT batch endpoint ===
 
 
 @app.get('/api/v1/pft/mds/details')
@@ -1223,6 +1252,10 @@ if __name__ == '__main__':
     print("    GET /api/v1/flaky?page=N&fail_on=2,3          - Flaky endpoint (fails first attempt)")
     print("    GET /api/v1/errors?error_type=429|500|503     - Simulate specific errors")
     print("    GET /api/v1/rate-limited?requests_per_second=2 - Actual rate limiting")
+    print("  PFT (strict one-record-per-request contract):")
+    print("    GET /api/v1/pft/mds/details?assessmentId=ID   - Single MDS detail")
+    print("    GET /api/v1/pft/batch/{data_type}             - "
+          + ("BENCHMARK batch handler (PFT_BATCH_BENCHMARK set)" if PFT_BATCH_BENCHMARK else "410 Gone"))
     print("  Health:")
     print("    GET /health                                   - Health check")
     uvicorn.run(app, host='0.0.0.0', port=port, log_level='info')
