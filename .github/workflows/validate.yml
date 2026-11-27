@@ -38,6 +38,22 @@ jobs:
       - name: validate fixtures, manifests and scripts
         run: python3 ci/checks/validate.py
 
+  # The test-server fixture's PFT contract (one HTTP request = one record, batch
+  # endpoint 410 Gone) was broken on main for months by an accidentally
+  # committed benchmark edit (39dc880) and only surfaced in the ops dev
+  # playbook. This runs the real app in-process and checks the contract.
+  test-server-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install the test-server's dependencies (same as its Dockerfile)
+        run: pip install --quiet fastapi uvicorn
+      - name: test-server PFT contract
+        run: python3 ci/checks/test_server_contract.py
+
   docs:
     runs-on: ubuntu-latest
     steps:
